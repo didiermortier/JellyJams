@@ -106,12 +106,22 @@
                         <select class="form-select" id="schedule_mode" name="schedule_mode" required>
                             <option value="manual" {% if settings.schedule_mode == 'manual' %}selected{% endif %}>Manual Only</option>
                             <option value="daily" {% if settings.schedule_mode == 'daily' %}selected{% endif %}>Daily</option>
+                            <option value="weekly" {% if settings.schedule_mode == 'weekly' %}selected{% endif %}>Weekly</option>
                             <option value="interval" {% if settings.schedule_mode == 'interval' %}selected{% endif %}>Interval</option>
                         </select>
                     </div>
+                    <div class="mb-3" id="schedule_weekday_section" style="display: none;">
+                        <label for="schedule_weekday" class="form-label">Weekly Generation Day</label>
+                        <select class="form-select" id="schedule_weekday" name="schedule_weekday">
+                            {% for day in ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+                            <option value="{{ day }}" {% if settings.schedule_weekday == day %}selected{% endif %}>{{ day.capitalize() }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
                     <div class="mb-3" id="schedule_time_section" style="display: none;">
-                        <label for="schedule_time" class="form-label">Daily Generation Time</label>
-                        <input type="time" class="form-control" id="schedule_time" name="schedule_time" value="{{ settings.schedule_time or '00:00' }}">
+                        <label for="schedule_time" class="form-label">Generation Time</label>
+                        <input type="time" class="form-control" id="schedule_time" name="schedule_time" value="{{ settings.schedule_time or '04:30' }}">
+                        <div class="form-text">Local time inside the container. Set the TZ environment variable to match your timezone.</div>
                     </div>
                     <div class="mb-3" id="generation_interval_section" style="display: none;">
                         <label for="generation_interval" class="form-label">Generation Interval (hours)</label>
@@ -273,6 +283,11 @@
                         <input class="form-check-input" type="checkbox" id="shuffle_tracks" name="shuffle_tracks" {% if settings.shuffle_tracks %}checked{% endif %}>
                         <label class="form-check-label" for="shuffle_tracks">Shuffle tracks in playlists</label>
                     </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="random_track_selection" name="random_track_selection" {% if settings.random_track_selection %}checked{% endif %}>
+                        <label class="form-check-label" for="random_track_selection">Pick a random selection each run</label>
+                        <div class="form-text">When a genre or decade holds more tracks than the maximum, take a random sample instead of always the same first tracks. Recommended on, otherwise a scheduled run selects the same songs every time.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -323,6 +338,7 @@ function populateAllSettings() {
     // Advanced
     $('#log_level').val(currentSettings.log_level || 'INFO');
     $('#shuffle_tracks').prop('checked', !!currentSettings.shuffle_tracks);
+    $('#random_track_selection').prop('checked', currentSettings.random_track_selection !== false);
 
     // Spotify
     $('#spotify_cover_art_enabled').prop('checked', !!currentSettings.spotify_cover_art_enabled);
@@ -479,7 +495,8 @@ function populateUserForm() {
 // Event handlers
 function handleScheduleModeChange() {
     const mode = $('#schedule_mode').val();
-    $('#schedule_time_section').toggle(mode === 'daily');
+    $('#schedule_time_section').toggle(mode === 'daily' || mode === 'weekly');
+    $('#schedule_weekday_section').toggle(mode === 'weekly');
     $('#generation_interval_section').toggle(mode === 'interval');
 }
 
@@ -562,6 +579,7 @@ function setupEventListeners() {
         
         // Ensure checkboxes that are not checked are sent as false
         settings.shuffle_tracks = $('#shuffle_tracks').is(':checked');
+        settings.random_track_selection = $('#random_track_selection').is(':checked');
         settings.spotify_cover_art_enabled = $('#spotify_cover_art_enabled').is(':checked');
         settings.deezer_cover_art_enabled = $('#deezer_cover_art_enabled').is(':checked');
         settings.auto_generate_on_startup = $('#auto_generate_on_startup').is(':checked');

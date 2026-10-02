@@ -96,8 +96,10 @@ class ConfigManager:
             'genre_grouping_enabled': getattr(config, 'genre_grouping_enabled', True),
             # Scheduling settings
             'auto_generate_on_startup': getattr(config, 'auto_generate_on_startup', False),
-            'schedule_mode': getattr(config, 'schedule_mode', 'manual'),
-            'schedule_time': getattr(config, 'schedule_time', '00:00')
+            'schedule_mode': getattr(config, 'schedule_mode', 'weekly'),
+            'schedule_weekday': getattr(config, 'schedule_weekday', 'sunday'),
+            'schedule_time': getattr(config, 'schedule_time', '04:30'),
+            'random_track_selection': getattr(config, 'random_track_selection', True)
         }
         
         # Load and merge web UI settings (these take precedence)
@@ -191,8 +193,10 @@ class ConfigManager:
         
         # Apply scheduling settings
         config.auto_generate_on_startup = settings.get('auto_generate_on_startup', getattr(config, 'auto_generate_on_startup', False))
-        config.schedule_mode = settings.get('schedule_mode', getattr(config, 'schedule_mode', 'manual'))
-        config.schedule_time = settings.get('schedule_time', getattr(config, 'schedule_time', '00:00'))
+        config.schedule_mode = settings.get('schedule_mode', getattr(config, 'schedule_mode', 'weekly'))
+        config.schedule_weekday = settings.get('schedule_weekday', getattr(config, 'schedule_weekday', 'sunday'))
+        config.schedule_time = settings.get('schedule_time', getattr(config, 'schedule_time', '04:30'))
+        config.random_track_selection = settings.get('random_track_selection', getattr(config, 'random_track_selection', True))
         
         # Reload settings
         config.load_web_ui_settings()
@@ -620,6 +624,29 @@ def save_web_ui_settings(new_settings):
     except Exception as e:
         logger.error(f"Error saving web UI settings: {e}")
         raise
+
+@app.route('/api/health')
+def api_health():
+    """Health probe for a monitor.
+
+    200 when the last generation succeeded (or none has run yet), 503 when the last
+    run failed. Any monitoring tool can watch this, which is what makes a failed
+    scheduled run visible instead of silent.
+    """
+    status = {}
+    try:
+        status_path = Path('/data/run_status.json')
+        if status_path.exists():
+            status = json.loads(status_path.read_text())
+    except Exception as e:
+        status = {'error': str(e)}
+
+    healthy = bool(status.get('success', True)) if status else True
+    return jsonify({
+        'healthy': healthy,
+        'last_run': status or 'no run recorded yet',
+    }), (200 if healthy else 503)
+
 
 @app.route('/api/generate', methods=['POST'])
 @requires_auth

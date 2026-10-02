@@ -5,20 +5,20 @@ Generates music playlists using Jellyfin API and saves them as XML files
 """
 
 import os
+import random
 import unicodedata
 import sys
 import time
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import requests
 import schedule
 import signal
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from xml.etree.ElementTree import Element, SubElement, tostring
-from xml.dom import minidom
 from io import BytesIO
 
 # PIL/Pillow imports for custom cover art generation
@@ -77,6 +77,9 @@ class Config:
         self.excluded_genres = []
         self.excluded_artists = []
         self.shuffle_tracks = True
+        # Pick a random sample when a genre/decade pool is bigger than the cap, instead
+        # of always taking the first N tracks in library order.
+        self.random_track_selection = True
         self.playlist_types = ['Genre','Year','Artist','Personal']
         
         # Playlist diversity settings
@@ -107,8 +110,9 @@ class Config:
         
         # Scheduling configuration
         self.auto_generate_on_startup = False
-        self.schedule_mode = 'manual'  # manual, daily, interval
-        self.schedule_time = '00:00'  # Time for daily mode (HH:MM)
+        self.schedule_mode = 'weekly'      # manual, daily, weekly, interval
+        self.schedule_weekday = 'sunday'   # weekday name, used by weekly mode
+        self.schedule_time = '04:30'       # HH:MM, container local time
         
         # Genre grouping/mapping system
         self.genre_grouping_enabled = True
@@ -138,6 +142,8 @@ class Config:
                     self.excluded_artists = web_settings['excluded_artists'] if isinstance(web_settings['excluded_artists'], list) else web_settings['excluded_artists'].split(',')
                 if 'shuffle_tracks' in web_settings:
                     self.shuffle_tracks = bool(web_settings['shuffle_tracks'])
+                if 'random_track_selection' in web_settings:
+                    self.random_track_selection = bool(web_settings['random_track_selection'])
                 if 'playlist_types' in web_settings:
                     self.playlist_types = web_settings['playlist_types'] if isinstance(web_settings['playlist_types'], list) else web_settings['playlist_types'].split(',')
                 if 'generation_interval' in web_settings:
@@ -168,6 +174,8 @@ class Config:
                     self.schedule_mode = web_settings['schedule_mode']
                 if 'schedule_time' in web_settings:
                     self.schedule_time = web_settings['schedule_time']
+                if 'schedule_weekday' in web_settings:
+                    self.schedule_weekday = web_settings['schedule_weekday']
                 if 'personal_playlist_min_user_tracks' in web_settings:
                     self.personal_playlist_min_user_tracks = int(web_settings['personal_playlist_min_user_tracks'])
                 if 'discovery_max_songs_per_album' in web_settings:
@@ -194,8 +202,14 @@ class Config:
             print(f"   Using environment variables instead")
     
     def _load_genre_mappings(self):
-        """Load comprehensive genre mapping system to consolidate similar genres"""
-        return {
+        """Load the genre groups, with each genre claimed by exactly one group.
+
+        Some genres are genuinely named in more than one list below. map_genre_to_group
+        returns the first group it finds, so a later listing is dead weight and the
+        grouping silently depends on dict order. Drop the duplicates here so the map
+        says what it does.
+        """
+        mappings = {
             # Rock and its many subgenres
             'Rock': [
                 'Rock', 'Classic Rock', 'Hard Rock', 'Soft Rock', 'Arena Rock', 'Art Rock',
@@ -364,7 +378,23 @@ class Config:
                 'Lounge'
             ]
         }
-    
+
+        claimed = {}
+        normalised = {}
+        for group, genres in mappings.items():
+            kept = []
+            for genre in genres:
+                if genre in claimed:
+                    logging.getLogger('jellyjams').debug(
+                        f"Dropping duplicate genre mapping '{genre}' from '{group}' "
+                        f"(already mapped to '{claimed[genre]}')"
+                    )
+                    continue
+                claimed[genre] = group
+                kept.append(genre)
+            normalised[group] = kept
+        return normalised
+
     def map_genre_to_group(self, genre):
         """Map a specific genre to its broader group category"""
         if not self.genre_grouping_enabled:
@@ -673,11 +703,20 @@ def setup_logging(config: Config):
     
     # File handler (with error handling)
     try:
-        file_handler = logging.FileHandler(log_dir / 'jellyjams.log')
+        # Rotating, so a long-running container cannot fill the disk with logs. The
+        # generator process and the web workers share this file, so a rollover can
+        # occasionally lose one backup across processes; losing a log line is
+        # preferable to an unbounded file.
+        file_handler = RotatingFileHandler(
+            log_dir / 'jellyjams.log',
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8',
+        )
         file_handler.setLevel(log_level_num)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
-        print(f"📝 File logging enabled: {log_dir / 'jellyjams.log'}")
+        print(f"📝 File logging enabled (rotating, 5 MB x 3): {log_dir / 'jellyjams.log'}")
     except Exception as e:
         print(f"⚠️ Could not create file handler: {e}")
         print("📺 Continuing with console logging only")
@@ -695,6 +734,33 @@ def setup_logging(config: Config):
     logger.debug("🔍 Debug logging is active and visible")
     
     return logger
+
+RUN_STATUS_FILE = '/data/run_status.json'
+
+
+def write_run_status(success: bool, summary: str = '', counts: Optional[Dict] = None):
+    """Record how the last generation went, so a failed run is visible outside the log.
+
+    Written into the app data volume and read by /api/health and the container
+    healthcheck, which means any monitoring tool can see it. Never raises: recording
+    the status must not be what breaks a run.
+    """
+    try:
+        payload = {
+            'last_run_finished': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'success': bool(success),
+            'summary': summary,
+            'counts': counts or {},
+        }
+        path = Path(RUN_STATUS_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2)
+        tmp.replace(path)
+    except Exception as e:
+        logging.getLogger('jellyjams').warning(f"Could not write run status: {e}")
+
 
 class DeezerClient:
     """Artist pictures from the public Deezer API, used for playlist cover art.
@@ -1140,39 +1206,45 @@ class JellyfinAPI:
                 'name': name
             }
 
-    def get_playlist_by_name(self, name: str, user_id: str = None) -> Dict:
-        """Check if a playlist with the given name already exists"""
+    def find_playlists_by_name(self, name: str, user_id: str = None) -> List[Dict]:
+        """Return every playlist whose name matches, so duplicates can be cleaned up.
+
+        Listing with a SearchTerm can miss items and returns only the first hits, which
+        is why a half-finished run can leave several playlists sharing one name. Listing
+        all playlists and comparing exact normalized names is reliable, and playlists
+        are few even on a large server.
+        """
         try:
             if not user_id:
                 users = self.get_users()
                 if not users:
-                    return None
+                    return []
                 user_id = users[0]['Id']
-            
+
             url = f"{self.config.jellyfin_url}/Users/{user_id}/Items"
             params = {
                 'IncludeItemTypes': 'Playlist',
                 'Recursive': 'true',
-                'SearchTerm': name
             }
-            
+
             response = self.session.get(url, params=params)
             response.raise_for_status()
-            
-            data = response.json()
-            playlists = data.get('Items', [])
-            
-            # Look for exact name match (normalize Unicode quotes/apostrophes)
-            for playlist in playlists:
-                pl_name = playlist.get('Name', '')
-                if normalize_name(pl_name).lower() == normalize_name(name).lower():
-                    return playlist
-            
-            return None
-            
+
+            # Normalize Unicode quotes/apostrophes before comparing
+            target = normalize_name(name).lower()
+            return [
+                playlist for playlist in response.json().get('Items', [])
+                if normalize_name(playlist.get('Name', '')).lower() == target
+            ]
+
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Error checking for existing playlist '{name}': {e}")
-            return None
+            return []
+
+    def get_playlist_by_name(self, name: str, user_id: str = None) -> Dict:
+        """Check if a playlist with the given name already exists"""
+        matches = self.find_playlists_by_name(name, user_id)
+        return matches[0] if matches else None
 
     def delete_playlist(self, playlist_id: str) -> bool:
         """Delete a playlist by ID"""
@@ -1209,6 +1281,8 @@ class PlaylistGenerator:
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
+        # Number of playlists written by the current generation pass
+        self.created_playlists = 0
         # Add caching for API queries to prevent repeated expensive calls
         self._artist_path_cache = {}
         self._audio_items_cache = None
@@ -1234,6 +1308,26 @@ class PlaylistGenerator:
             self.logger.debug(f"📋 Using cached audio items ({len(self._audio_items_cache)} items, cached {int((current_time - self._cache_timestamp)/60)} minutes ago)")
         
         return self._audio_items_cache
+
+    def _select_tracks(self, tracks: List[Dict]) -> List[Dict]:
+        """Choose which tracks go into one playlist.
+
+        Upstream took the first N tracks in library order and then shuffled them, so a
+        genre playlist held exactly the same songs on every run and the rest of the
+        catalogue never appeared. With random_track_selection on (the default) a random
+        sample is taken instead, so a daily run rotates what gets played. Turn it off to
+        keep the old deterministic behaviour.
+        """
+        limit = self.config.max_tracks_per_playlist
+        if len(tracks) <= limit:
+            selected = list(tracks)
+        elif getattr(self.config, 'random_track_selection', True):
+            selected = random.sample(tracks, limit)
+        else:
+            selected = list(tracks[:limit])
+        if self.config.shuffle_tracks:
+            random.shuffle(selected)
+        return selected
 
     def copy_custom_cover_art(self, playlist_name: str, playlist_dir: Path) -> bool:
         """Copy custom cover art from /app/cover/ directory with fallback system and extension preservation"""
@@ -1980,57 +2074,6 @@ class PlaylistGenerator:
             self.logger.error(f"Error applying diversity controls: {e}")
             return tracks  # Return original tracks if filtering fails
 
-    def create_playlist_xml(self, playlist_name: str, tracks: List[Dict]) -> str:
-        """Create playlist XML in Jellyfin format"""
-        root = Element('Item')
-        
-        # Add metadata
-        SubElement(root, 'Added').text = datetime.utcnow().strftime('%m/%d/%Y %H:%M:%S')
-        SubElement(root, 'LockData').text = 'false'
-        SubElement(root, 'LocalTitle').text = playlist_name
-        
-        # Calculate total runtime
-        total_runtime = sum(track.get('RunTimeTicks', 0) for track in tracks)
-        SubElement(root, 'RunningTime').text = str(total_runtime)
-        
-        # Get all unique genres
-        all_genres = set()
-        for track in tracks:
-            if track.get('Genres'):
-                # Parse genres - handle both list and semicolon-separated string formats
-                if isinstance(track['Genres'], list):
-                    for genre_item in track['Genres']:
-                        if isinstance(genre_item, str) and ';' in genre_item:
-                            # Split semicolon-separated genres
-                            all_genres.update([g.strip() for g in genre_item.split(';') if g.strip()])
-                        else:
-                            all_genres.add(genre_item)
-                elif isinstance(track['Genres'], str):
-                    # Handle string format with semicolons
-                    if ';' in track['Genres']:
-                        all_genres.update([g.strip() for g in track['Genres'].split(';') if g.strip()])
-                    else:
-                        all_genres.add(track['Genres'])
-        SubElement(root, 'Genres').text = '|'.join(sorted(all_genres))
-        
-        SubElement(root, 'PlaylistMediaType').text = 'Audio'
-        
-        # Add playlist items
-        playlist_items = SubElement(root, 'PlaylistItems')
-        for track in tracks:
-            if track.get('Path'):
-                playlist_item = SubElement(playlist_items, 'PlaylistItem')
-                SubElement(playlist_item, 'Path').text = track['Path']
-        
-        # Add empty elements
-        SubElement(root, 'Shares')
-        SubElement(root, 'OwnerUserId').text = '00000000-0000-0000-0000-000000000000'
-        
-        # Format XML
-        rough_string = tostring(root, 'unicode')
-        reparsed = minidom.parseString(rough_string)
-        return reparsed.toprettyxml(indent='  ')
-
     def _sanitize_playlist_name(self, name: str) -> str:
         """Sanitize playlist name to remove problematic characters"""
         if not name:
@@ -2110,19 +2153,14 @@ class PlaylistGenerator:
             
             self.logger.info(f"Creating {privacy_text} {playlist_type} playlist: {sanitized_name} with {len(track_ids)} tracks")
             
-            # Check if playlist already exists and delete it (use original name for API calls)
-            # Use normalized name for API lookups/creation to avoid Unicode duplicates (e.g., ’ vs ')
+            # Replace the playlist safely: look up what exists, create the new one, and
+            # only remove the older copies once the create has succeeded. Deleting first
+            # (as upstream does) loses the playlist outright if the create then fails.
             api_name = normalize_name(name)
             self.logger.info(f"Checking for existing playlist: {api_name}")
-            existing_playlist = self.jellyfin.get_playlist_by_name(api_name, user_id)
-            if existing_playlist:
-                self.logger.info(f"Playlist '{name}' already exists, attempting to delete old version with ID: {existing_playlist.get('Id')}")
-                delete_success = self.jellyfin.delete_playlist(existing_playlist['Id'])
-                if delete_success:
-                    self.logger.info(f"✅ Successfully deleted existing playlist")
-                else:
-                    self.logger.info(f"🔄 Could not delete existing playlist (will create new version anyway)")
-                    self.logger.debug(f"Note: Jellyfin may create a duplicate playlist or handle this automatically")
+            stale_playlists = self.jellyfin.find_playlists_by_name(api_name, user_id)
+            if stale_playlists:
+                self.logger.info(f"Found {len(stale_playlists)} existing playlist(s) named '{api_name}'")
             else:
                 self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
         
@@ -2132,6 +2170,16 @@ class PlaylistGenerator:
             result = self.jellyfin.create_playlist(api_name, track_ids, user_id, is_public)
             
             if result['success']:
+                self.created_playlists += 1
+                new_id = result.get('playlist_id')
+                for old in stale_playlists:
+                    old_id = old.get('Id')
+                    if old_id and old_id != new_id:
+                        if self.jellyfin.delete_playlist(old_id):
+                            self.logger.info(f"🧹 Removed the previous copy of '{api_name}' (id {old_id})")
+                        else:
+                            self.logger.warning(f"⚠️ Could not remove the previous copy of '{api_name}' (id {old_id})")
+                
                 self.logger.info(f"✅ Successfully created {privacy_text} playlist '{sanitized_name}' with {result['track_count']} tracks")
                 
                 # Create directory for cover art storage (use Jellyfin-style sanitized name for filesystem)
@@ -2246,6 +2294,8 @@ class PlaylistGenerator:
                 return playlist_dir
             else:
                 self.logger.error(f"❌ Failed to create playlist '{name}': {result.get('error', 'Unknown error')}")
+                if stale_playlists:
+                    self.logger.warning(f"⚠️ The existing playlist '{name}' was left untouched")
                 self.logger.info(f"=== PLAYLIST CREATION FAILED ===")
                 return None
                 
@@ -2327,11 +2377,8 @@ class PlaylistGenerator:
                 self.logger.info(f"Skipping genre '{genre}' - only {len(unique_artists)} artists (minimum: {self.config.min_artist_diversity})")
                 continue
                 
-            # Limit tracks and shuffle if requested
-            limited_tracks = tracks[:self.config.max_tracks_per_playlist]
-            if self.config.shuffle_tracks:
-                import random
-                random.shuffle(limited_tracks)
+            # Pick a random sample of the pool (see _select_tracks)
+            limited_tracks = self._select_tracks(tracks)
             
             playlist_name = f"{genre} Radio"
             self.save_playlist("Genre", playlist_name, limited_tracks)
@@ -2408,11 +2455,8 @@ class PlaylistGenerator:
                 skipped_decades.append(f"{decade} ({len(unique_artists)} artists)")
                 continue
                 
-            # Limit tracks and shuffle if requested
-            limited_tracks = tracks[:self.config.max_tracks_per_playlist]
-            if self.config.shuffle_tracks:
-                import random
-                random.shuffle(limited_tracks)
+            # Pick a random sample of the pool (see _select_tracks)
+            limited_tracks = self._select_tracks(tracks)
             
             playlist_name = f"Back to the {decade}"
             self.save_playlist("Decade", playlist_name, limited_tracks)
@@ -2503,11 +2547,8 @@ class PlaylistGenerator:
             # Debug album information
             self.logger.debug(f"Albums for {artist}: {list(data['albums'])}")
             
-            # Limit tracks and shuffle if requested
-            limited_tracks = tracks[:self.config.max_tracks_per_playlist]
-            if self.config.shuffle_tracks:
-                import random
-                random.shuffle(limited_tracks)
+            # Pick a random sample of the pool (see _select_tracks)
+            limited_tracks = self._select_tracks(tracks)
             
             # Create playlist name and log it for debugging
             playlist_name = f"This is {artist}!"
@@ -2654,11 +2695,7 @@ class PlaylistGenerator:
                     self.logger.warning(f"Only {len(top_tracks)} tracks found for {user_name}, minimum is {self.config.min_tracks_per_playlist}")
                     return
                 
-                # Limit to configured max tracks
-                limited_tracks = top_tracks[:self.config.max_tracks_per_playlist]
-                if self.config.shuffle_tracks:
-                    import random
-                    random.shuffle(limited_tracks)
+                limited_tracks = self._select_tracks(top_tracks)
                 
                 playlist_name = f"Top Tracks - {user_name}"
                 self.save_playlist("Personal", playlist_name, limited_tracks, user_id)
@@ -2699,12 +2736,7 @@ class PlaylistGenerator:
                     # Apply diversity controls: max songs per album and per artist
                     diverse_tracks = self._apply_discovery_diversity_controls(similar_tracks)
                     
-                    if self.config.shuffle_tracks:
-                        import random
-                        random.shuffle(diverse_tracks)
-                    
-                    # Limit to final playlist size
-                    final_tracks = diverse_tracks[:self.config.max_tracks_per_playlist]
+                    final_tracks = self._select_tracks(diverse_tracks)
                     
                     playlist_name = f"Discovery Mix - {user_name}"
                     self.save_playlist("Personal", playlist_name, final_tracks, user_id)
@@ -2723,11 +2755,7 @@ class PlaylistGenerator:
             recent_tracks = self.jellyfin.get_recently_played(user_id, limit=30)
             
             if recent_tracks:
-                # Limit to configured max tracks
-                limited_tracks = recent_tracks[:self.config.max_tracks_per_playlist]
-                if self.config.shuffle_tracks:
-                    import random
-                    random.shuffle(limited_tracks)
+                limited_tracks = self._select_tracks(recent_tracks)
                 
                 playlist_name = f"Recent Favorites - {user_name}"
                 self.save_playlist("Personal", playlist_name, limited_tracks, user_id)
@@ -2789,12 +2817,8 @@ class PlaylistGenerator:
                     genre_mix_tracks.extend(selected)
             
             if genre_mix_tracks:
-                if self.config.shuffle_tracks:
-                    import random
-                    random.shuffle(genre_mix_tracks)
-                
                 # Limit to max tracks
-                limited_tracks = genre_mix_tracks[:self.config.max_tracks_per_playlist]
+                limited_tracks = self._select_tracks(genre_mix_tracks)
                 
                 playlist_name = f"Genre Mix - {user_name}"
                 self.save_playlist("Personal", playlist_name, limited_tracks, user_id)
@@ -2806,7 +2830,23 @@ class PlaylistGenerator:
             self.logger.error(f"Error generating genre mix playlist for {user_name}: {e}")
 
     def generate_playlists(self):
-        """Main playlist generation function"""
+        """Run one generation pass and record its outcome for monitoring."""
+        try:
+            counts = self._generate_playlists()
+        except Exception as e:
+            self.logger.exception("Playlist generation raised an exception")
+            write_run_status(False, summary=f"{type(e).__name__}: {e}")
+            raise
+
+        if counts is None:
+            write_run_status(False, summary="aborted before any playlist was written")
+        else:
+            write_run_status(True, summary="completed", counts=counts)
+        return counts
+
+    def _generate_playlists(self):
+        """Main playlist generation function. Returns counts, or None if it aborted."""
+        self.created_playlists = 0
         self.logger.info("🎵 ========== STARTING JELLYJAMS PLAYLIST GENERATION ==========")
         self.logger.info(f"🔧 Configuration: Max tracks: {self.config.max_tracks_per_playlist}, Min tracks: {self.config.min_tracks_per_playlist}")
         self.logger.info(f"🔧 Playlist types: {', '.join(self.config.playlist_types)}")
@@ -2818,7 +2858,7 @@ class PlaylistGenerator:
         self.logger.info("🌐 Testing Jellyfin connection...")
         if not self.jellyfin.test_connection():
             self.logger.error("❌ Cannot connect to Jellyfin. Aborting playlist generation.")
-            return
+            return None
         self.logger.info("✅ Jellyfin connection successful")
         
         # Get audio items
@@ -2826,7 +2866,7 @@ class PlaylistGenerator:
         audio_items = self.jellyfin.get_audio_items()
         if not audio_items:
             self.logger.warning("⚠️ No audio items found. Aborting playlist generation.")
-            return
+            return None
         
         self.logger.info(f"📊 Found {len(audio_items)} audio items in library")
         
@@ -2852,6 +2892,7 @@ class PlaylistGenerator:
                 self.logger.warning("⚠️ Failed to trigger media library scan")
         
         self.logger.info("JellyJams playlist generation completed successfully!")
+        return {'playlists_created': self.created_playlists}
 
 def main():
     """Main application entry point"""
@@ -2881,21 +2922,40 @@ def main():
         logger.info("⏸️ Skipping initial playlist generation (startup generation disabled)")
     
     # Setup scheduling based on configuration
+    WEEKDAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+
+    def parse_time(value, fallback="04:30"):
+        """Return a validated HH:MM string, falling back on a bad value."""
+        try:
+            hour, minute = map(int, str(value).split(':'))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return f"{hour:02d}:{minute:02d}"
+        except (ValueError, AttributeError):
+            pass
+        logger.error(f"Invalid schedule time {value!r}, using {fallback}")
+        return fallback
+
     if config.schedule_mode == 'manual':
         logger.info("📋 Manual mode: Playlists will only be generated via web UI or API calls")
+
     elif config.schedule_mode == 'daily':
-        # Parse schedule time (HH:MM format)
-        try:
-            hour, minute = map(int, config.schedule_time.split(':'))
-            schedule.every().day.at(f"{hour:02d}:{minute:02d}").do(generator.generate_playlists)
-            logger.info(f"⏰ Daily generation scheduled at {config.schedule_time}")
-        except ValueError:
-            logger.error(f"Invalid schedule time format: {config.schedule_time}. Using default 00:00")
-            schedule.every().day.at("00:00").do(generator.generate_playlists)
-            logger.info("⏰ Daily generation scheduled at 00:00 (midnight)")
+        at = parse_time(config.schedule_time)
+        schedule.every().day.at(at).do(generator.generate_playlists)
+        logger.info(f"⏰ Daily generation scheduled at {at}")
+
+    elif config.schedule_mode == 'weekly':
+        at = parse_time(config.schedule_time)
+        weekday = str(getattr(config, 'schedule_weekday', 'sunday')).lower()
+        if weekday not in WEEKDAYS:
+            logger.error(f"Invalid weekday {config.schedule_weekday!r}, using sunday")
+            weekday = 'sunday'
+        getattr(schedule.every(), weekday).at(at).do(generator.generate_playlists)
+        logger.info(f"⏰ Weekly generation scheduled for {weekday.capitalize()} at {at}")
+
     elif config.schedule_mode == 'interval':
         schedule.every(config.generation_interval).hours.do(generator.generate_playlists)
         logger.info(f"⏰ Interval generation scheduled every {config.generation_interval} hours")
+
     else:
         logger.warning(f"Unknown schedule mode: {config.schedule_mode}. Defaulting to manual mode.")
     

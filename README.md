@@ -21,6 +21,17 @@
 >    needs no account and no API key, unlike the Spotify search endpoint that returns 403 without a
 >    paid app subscription. Enabled with `deezer_cover_art_enabled`, tried before Spotify for
 >    "This is <artist>!" playlists.
+> 5. Playlists are replaced safely: the new playlist is created first and the older copy is only
+>    removed once that succeeded, so a failed create cannot lose a playlist. Upstream deleted first.
+> 6. `random_track_selection` (default on) takes a random sample when a genre or decade holds more
+>    tracks than the maximum. Upstream always took the first N in library order, so a scheduled run
+>    produced the same songs every time.
+> 7. Weekly scheduling. `schedule_mode` now accepts manual, daily, weekly (default) or interval, with
+>    `schedule_weekday` choosing the day. The default time is 04:30 in the container's timezone, so
+>    set the `TZ` environment variable.
+> 8. Each run records its outcome to `/data/run_status.json`, exposed at `GET /api/health` (503 when
+>    the last run failed) and used by the container `HEALTHCHECK`, so a failed scheduled run shows up
+>    in any monitoring tool rather than only in the log.
 
 **JellyJams** is a modern, standalone Docker container that automatically generates music playlists for your Jellyfin media server using the Jellyfin REST API. It features a beautiful dark-themed web UI for easy configuration and management.
 
