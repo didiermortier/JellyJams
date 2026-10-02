@@ -801,6 +801,17 @@ class DeezerClient:
             except Exception as chmod_err:
                 self.logger.debug(f"chmod failed for {target}: {chmod_err}")
 
+            # Drop the older JellyJams covers so Jellyfin cannot keep serving one of
+            # them instead of the picture we just fetched.
+            for stale in ('cover.webp', 'folder.webp', 'folder.jpg', 'cover.png', 'folder.png'):
+                stale_path = playlist_dir / stale
+                if stale_path.exists():
+                    try:
+                        stale_path.unlink()
+                        self.logger.debug(f"Removed stale cover: {stale_path}")
+                    except Exception as stale_err:
+                        self.logger.debug(f"Could not remove {stale_path}: {stale_err}")
+
             self.stats['downloads'] += 1
             self.logger.info(
                 f"✅ Deezer cover art for {artist_name}: "
