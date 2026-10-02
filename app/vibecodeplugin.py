@@ -1226,6 +1226,9 @@ class JellyfinAPI:
             params = {
                 'IncludeItemTypes': 'Playlist',
                 'Recursive': 'true',
+                # Path is needed to clean up the playlist's folder on disk, which
+                # Jellyfin leaves behind for the scanner to re-add as an empty duplicate.
+                'Fields': 'Path',
             }
 
             response = self.session.get(url, params=params)
