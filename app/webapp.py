@@ -92,6 +92,7 @@ class ConfigManager:
             'min_albums_per_artist': getattr(config, 'min_albums_per_artist', 2),
             'min_albums_per_decade': getattr(config, 'min_albums_per_decade', 3),
             'trigger_library_scan': getattr(config, 'trigger_library_scan', True),
+            'genre_grouping_enabled': getattr(config, 'genre_grouping_enabled', True),
             # Scheduling settings
             'auto_generate_on_startup': getattr(config, 'auto_generate_on_startup', False),
             'schedule_mode': getattr(config, 'schedule_mode', 'manual'),
@@ -153,6 +154,7 @@ class ConfigManager:
         config.excluded_genres = settings.get('excluded_genres', config.excluded_genres)
         config.excluded_artists = settings.get('excluded_artists', getattr(config, 'excluded_artists', []))
         config.shuffle_tracks = settings.get('shuffle_tracks', config.shuffle_tracks)
+        config.genre_grouping_enabled = settings.get('genre_grouping_enabled', getattr(config, 'genre_grouping_enabled', True))
         config.playlist_types = settings.get('playlist_types', config.playlist_types)
         
         # Ensure numeric settings are cast to integers (POSTed JSON may contain strings)

@@ -175,6 +175,8 @@ class Config:
                     self.min_albums_per_decade = int(web_settings['min_albums_per_decade'])
                 if 'trigger_library_scan' in web_settings:
                     self.trigger_library_scan = bool(web_settings['trigger_library_scan'])
+                if 'genre_grouping_enabled' in web_settings:
+                    self.genre_grouping_enabled = bool(web_settings['genre_grouping_enabled'])
                     
                 print(f"🎵  JellyJams web UI settings loaded - overriding environment variables")
                 print(f"   Max tracks: {self.max_tracks_per_playlist}, Min tracks: {self.min_tracks_per_playlist}")

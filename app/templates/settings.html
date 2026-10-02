@@ -53,6 +53,13 @@
                         <input type="number" class="form-control" id="min_albums_per_artist" name="min_albums_per_artist" value="{{ settings.min_albums_per_artist or 2 }}" min="1" max="50" required>
                         <div class="form-text">Minimum number of albums required to create an artist playlist</div>
                     </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="genre_grouping_enabled" name="genre_grouping_enabled" {% if settings.genre_grouping_enabled %}checked{% endif %}>
+                            <label class="form-check-label" for="genre_grouping_enabled">Group similar genres into one playlist</label>
+                        </div>
+                        <div class="form-text">On: House, Techno, Trance and Tech House all become "Electronic Radio". Off: every genre gets its own playlist.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -305,6 +312,7 @@ function populateAllSettings() {
     $('#schedule_time').val(currentSettings.schedule_time || '00:00');
     $('#generation_interval').val(currentSettings.generation_interval || 24);
     $('#auto_generate_on_startup').prop('checked', !!currentSettings.auto_generate_on_startup);
+    $('#genre_grouping_enabled').prop('checked', !!currentSettings.genre_grouping_enabled);
 
     // Advanced
     $('#log_level').val(currentSettings.log_level || 'INFO');
@@ -549,6 +557,7 @@ function setupEventListeners() {
         settings.shuffle_tracks = $('#shuffle_tracks').is(':checked');
         settings.spotify_cover_art_enabled = $('#spotify_cover_art_enabled').is(':checked');
         settings.auto_generate_on_startup = $('#auto_generate_on_startup').is(':checked');
+        settings.genre_grouping_enabled = $('#genre_grouping_enabled').is(':checked');
 
 
         $.ajax({
