@@ -16,6 +16,7 @@ import requests
 import schedule
 import signal
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -1309,6 +1310,72 @@ class PlaylistGenerator:
         
         return self._audio_items_cache
 
+    def _playlist_track_ids(self, playlist_id: str, user_id: str) -> List[str]:
+        """Track ids currently in a playlist, used to restore it if a replace fails."""
+        try:
+            url = f"{self.jellyfin.config.jellyfin_url}/Playlists/{playlist_id}/Items"
+            response = self.jellyfin.session.get(url, params={'UserId': user_id})
+            response.raise_for_status()
+            return [item['Id'] for item in response.json().get('Items', []) if item.get('Id')]
+        except Exception as e:
+            self.logger.debug(f"Could not read tracks of playlist {playlist_id}: {e}")
+            return []
+
+    def _remove_playlist_folder(self, jellyfin_path: str):
+        """Delete a playlist's folder, mapping Jellyfin's path onto ours.
+
+        Jellyfin reports its own container path (/config/data/data/playlists/<name>)
+        while this container mounts the same folder at /playlists, so only the final
+        path segment travels. A path that does not resolve to a direct child of the
+        playlist folder is left alone.
+        """
+        try:
+            name = os.path.basename(str(jellyfin_path or '').rstrip('/'))
+            if not name:
+                return
+            root = Path(self.config.playlist_folder).resolve()
+            target = (root / name).resolve()
+            if target.parent != root:
+                self.logger.warning(f"Refusing to remove unexpected path: {target}")
+                return
+            if target.is_dir():
+                shutil.rmtree(target)
+                self.logger.debug(f"Removed playlist folder: {target}")
+        except Exception as e:
+            self.logger.debug(f"Could not remove playlist folder {jellyfin_path}: {e}")
+
+    def _remove_existing_playlists(self, name: str, user_id: str) -> List[str]:
+        """Remove every playlist with this name and its folder, returning its tracks.
+
+        Jellyfin derives the playlist folder from the playlist name and appends a number
+        when that name is taken, so a replace has to free the name first or it lands in
+        "Name1". The folder also outlives the item, and a leftover folder is re-scanned
+        into an empty duplicate. The returned track ids let a failed create be rolled
+        back, so the playlist is never simply lost.
+        """
+        existing = self.jellyfin.find_playlists_by_name(name, user_id)
+        if not existing:
+            self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
+            return []
+
+        self.logger.info(f"Found {len(existing)} existing playlist(s) named '{name}'")
+
+        rollback_tracks: List[str] = []
+        for item in existing:
+            ids = self._playlist_track_ids(item.get('Id'), user_id)
+            if len(ids) > len(rollback_tracks):
+                rollback_tracks = ids
+
+        for item in existing:
+            playlist_id = item.get('Id')
+            if self.jellyfin.delete_playlist(playlist_id):
+                self.logger.info(f"🧹 Removed previous playlist '{name}' (id {playlist_id})")
+            else:
+                self.logger.warning(f"⚠️ Could not remove previous playlist '{name}' (id {playlist_id})")
+            self._remove_playlist_folder(item.get('Path'))
+
+        return rollback_tracks
+
     def _select_tracks(self, tracks: List[Dict]) -> List[Dict]:
         """Choose which tracks go into one playlist.
 
@@ -2153,16 +2220,20 @@ class PlaylistGenerator:
             
             self.logger.info(f"Creating {privacy_text} {playlist_type} playlist: {sanitized_name} with {len(track_ids)} tracks")
             
-            # Replace the playlist safely: look up what exists, create the new one, and
-            # only remove the older copies once the create has succeeded. Deleting first
-            # (as upstream does) loses the playlist outright if the create then fails.
+            # Jellyfin names each playlist's folder after the playlist and appends a
+            # number when that name is taken, so creating a second copy before removing
+            # the first gives you "House Radio" and "House Radio1". The folder also
+            # outlives the item, which is what turns an orphan into an empty duplicate
+            # on the next scan. So: remove the old copies and their folders first, keep
+            # their track list, and put it back if the create then fails.
             api_name = normalize_name(name)
             self.logger.info(f"Checking for existing playlist: {api_name}")
-            stale_playlists = self.jellyfin.find_playlists_by_name(api_name, user_id)
-            if stale_playlists:
-                self.logger.info(f"Found {len(stale_playlists)} existing playlist(s) named '{api_name}'")
-            else:
-                self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
+            rollback_tracks = self._remove_existing_playlists(api_name, user_id)
+            if rollback_tracks:
+                self.logger.info(
+                    f"Replacing the existing playlist, {len(rollback_tracks)} of its "
+                    f"tracks kept in case the new create fails"
+                )
         
             # Create the playlist via API with proper privacy settings (use original name for API)
             self.logger.info(f"🔨 Creating new playlist via Jellyfin API...")
@@ -2171,15 +2242,6 @@ class PlaylistGenerator:
             
             if result['success']:
                 self.created_playlists += 1
-                new_id = result.get('playlist_id')
-                for old in stale_playlists:
-                    old_id = old.get('Id')
-                    if old_id and old_id != new_id:
-                        if self.jellyfin.delete_playlist(old_id):
-                            self.logger.info(f"🧹 Removed the previous copy of '{api_name}' (id {old_id})")
-                        else:
-                            self.logger.warning(f"⚠️ Could not remove the previous copy of '{api_name}' (id {old_id})")
-                
                 self.logger.info(f"✅ Successfully created {privacy_text} playlist '{sanitized_name}' with {result['track_count']} tracks")
                 
                 # Create directory for cover art storage (use Jellyfin-style sanitized name for filesystem)
@@ -2294,8 +2356,15 @@ class PlaylistGenerator:
                 return playlist_dir
             else:
                 self.logger.error(f"❌ Failed to create playlist '{name}': {result.get('error', 'Unknown error')}")
-                if stale_playlists:
-                    self.logger.warning(f"⚠️ The existing playlist '{name}' was left untouched")
+                if rollback_tracks:
+                    self.logger.warning(
+                        f"⚠️ Restoring the previous playlist '{name}' from its track list"
+                    )
+                    restored = self.jellyfin.create_playlist(api_name, rollback_tracks, user_id, is_public)
+                    if restored.get('success'):
+                        self.logger.info(f"✅ Previous playlist '{name}' restored")
+                    else:
+                        self.logger.error(f"❌ Could not restore '{name}': {restored.get('error')}")
                 self.logger.info(f"=== PLAYLIST CREATION FAILED ===")
                 return None
                 
