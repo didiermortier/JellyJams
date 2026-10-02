@@ -112,10 +112,24 @@ class ConfigManager:
         return default_settings
     
     def save_settings(self, settings: Dict):
-        """Save settings to JSON file"""
+        """Save settings to JSON file, merging into what is already stored.
+
+        The endpoint accepts a partial payload, so writing the POSTed dict
+        verbatim silently deletes every key the caller did not send.
+        """
         try:
+            existing = {}
+            if Path(self.config_file).exists():
+                try:
+                    with open(self.config_file, 'r') as f:
+                        existing = json.load(f) or {}
+                except (json.JSONDecodeError, OSError):
+                    existing = {}
+
+            existing.update(settings or {})
+
             with open(self.config_file, 'w') as f:
-                json.dump(settings, f, indent=2)
+                json.dump(existing, f, indent=2)
             return True
         except Exception as e:
             logger.error(f"Error saving settings: {e}")
