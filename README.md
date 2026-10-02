@@ -3,15 +3,24 @@
   <img src="jellyjams.jpeg" alt="JellyJams Logo" />
 </p>
 
-> **Fork note (didiermortier/JellyJams).** Upstream is unmaintained since Nov 2025. This fork
-> fixes Jellyfin 12 compatibility so it runs again on Jellyfin 12.1.
+> **Fork note (didiermortier/JellyJams).** Upstream is unmaintained since Nov 2025. This fork keeps
+> it running on Jellyfin 12.1 and adds a Deezer cover art source.
 >
-> Change: `app/vibecodeplugin.py` now authenticates with the standard
-> `Authorization: MediaBrowser Token=...` header. The old `X-Emby-Token` header that upstream
-> sends is rejected with HTTP 401 by Jellyfin 12 (the legacy auth scheme was disabled in 12.0),
-> which made every generation run abort at "Cannot connect to Jellyfin".
+> Changes against upstream:
 >
-> Only this one line differs from upstream so the fork stays easy to re-sync.
+> 1. `app/vibecodeplugin.py`: authenticate with the standard
+>    `Authorization: MediaBrowser Token=...` header. The old `X-Emby-Token` header that upstream
+>    sends is rejected with HTTP 401 by Jellyfin 12 (the legacy auth scheme was disabled in 12.0),
+>    which made every generation run abort at "Cannot connect to Jellyfin".
+> 2. `app/webapp.py`: `POST /api/settings` used to write the request body straight to
+>    `settings.json`, so a partial update deleted every setting it did not contain. It now merges.
+> 3. `genre_grouping_enabled` is a setting instead of hardcoded on, exposed as a checkbox. Off
+>    means every genre gets its own playlist instead of all subgenres folding into "Electronic
+>    Radio".
+> 4. New `DeezerClient`: artist cover art from the public Deezer API (`api.deezer.com`), which
+>    needs no account and no API key, unlike the Spotify search endpoint that returns 403 without a
+>    paid app subscription. Enabled with `deezer_cover_art_enabled`, tried before Spotify for
+>    "This is <artist>!" playlists.
 
 **JellyJams** is a modern, standalone Docker container that automatically generates music playlists for your Jellyfin media server using the Jellyfin REST API. It features a beautiful dark-themed web UI for easy configuration and management.
 

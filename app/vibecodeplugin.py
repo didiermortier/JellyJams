@@ -86,6 +86,9 @@ class Config:
         self.spotify_client_id = ''
         self.spotify_client_secret = ''
         self.spotify_cover_art_enabled = False
+
+        # Deezer cover art (public API, no key or account needed)
+        self.deezer_cover_art_enabled = False
         
         # User configuration for personalized playlists
         self.personal_playlist_users = 'all'
@@ -149,6 +152,8 @@ class Config:
                     self.spotify_client_secret = web_settings['spotify_client_secret']
                 if 'spotify_cover_art_enabled' in web_settings:
                     self.spotify_cover_art_enabled = bool(web_settings['spotify_cover_art_enabled'])
+                if 'deezer_cover_art_enabled' in web_settings:
+                    self.deezer_cover_art_enabled = bool(web_settings['deezer_cover_art_enabled'])
                 
                 # User configuration for personalized playlists
                 if 'personal_playlist_users' in web_settings:
@@ -691,6 +696,139 @@ def setup_logging(config: Config):
     
     return logger
 
+class DeezerClient:
+    """Artist pictures from the public Deezer API, used for playlist cover art.
+
+    api.deezer.com needs no API key and no account, unlike the Spotify search
+    endpoint that returns 403 unless the app owner has a paid subscription.
+    picture_xl is a square 1000x1000 image.
+    """
+
+    API = "https://api.deezer.com"
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.stats = {'searches': 0, 'downloads': 0, 'errors': 0}
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'JellyJams/1.0 (+https://github.com/didiermortier/JellyJams)',
+            'Accept': 'application/json',
+        })
+        if not self.is_enabled():
+            self.logger.info("Deezer cover art is disabled in configuration")
+
+    def is_enabled(self) -> bool:
+        return bool(getattr(self.config, 'deezer_cover_art_enabled', False))
+
+    def search_artist(self, artist_name: str) -> Optional[Dict]:
+        """Return the best matching Deezer artist for a name, or None."""
+        if not self.is_enabled() or not artist_name:
+            return None
+        try:
+            resp = self.session.get(
+                f"{self.API}/search/artist",
+                params={'q': artist_name, 'limit': 5},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            candidates = (resp.json() or {}).get('data') or []
+            if not candidates:
+                self.logger.info(f"🔎 Deezer: no artist match for {artist_name!r}")
+                return None
+
+            target = normalize_name(artist_name).lower()
+            best = None
+            for cand in candidates:
+                name = normalize_name(cand.get('name') or '').lower()
+                if name == target:
+                    best = cand
+                    break
+                if best is None and name and (name in target or target in name):
+                    best = cand
+            best = best or candidates[0]
+            self.stats['searches'] += 1
+            return best
+        except Exception as e:
+            self.stats['errors'] += 1
+            self.logger.warning(f"🌐 Deezer artist search failed for {artist_name}: {e}")
+            return None
+
+    def get_artist_cover_art(self, artist_name: str, playlist_dir: Path) -> bool:
+        """Save the artist's Deezer picture as cover.jpg in playlist_dir."""
+        if not self.is_enabled():
+            return False
+
+        artist = self.search_artist(artist_name)
+        if not artist:
+            return False
+
+        url = (artist.get('picture_xl') or artist.get('picture_big')
+               or artist.get('picture_medium'))
+        if not url:
+            self.logger.info(f"🔎 Deezer: no picture for {artist_name!r}")
+            return False
+
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            self.logger.warning("Pillow not available, skipping Deezer cover art")
+            return False
+
+        try:
+            resp = self.session.get(url, timeout=20)
+            resp.raise_for_status()
+            image = PILImage.open(BytesIO(resp.content))
+            if image.width < 300 or image.height < 300:
+                self.logger.info(
+                    f"🔎 Deezer: picture too small for {artist_name!r} "
+                    f"({image.width}x{image.height})"
+                )
+                return False
+
+            # Jellyfin playlist covers are square, so centre-crop then cap the size.
+            side = min(image.width, image.height)
+            left = (image.width - side) // 2
+            top = (image.height - side) // 2
+            image = image.convert('RGB').crop((left, top, left + side, top + side))
+            if side != 1000:
+                image = image.resize((1000, 1000), PILImage.Resampling.LANCZOS)
+
+            target = playlist_dir / 'cover.jpg'
+            image.save(target, 'JPEG', quality=90)
+            try:
+                os.chmod(target, 0o664)
+            except Exception as chmod_err:
+                self.logger.debug(f"chmod failed for {target}: {chmod_err}")
+
+            self.stats['downloads'] += 1
+            self.logger.info(
+                f"✅ Deezer cover art for {artist_name}: "
+                f"{artist.get('name')} -> {target}"
+            )
+            return True
+        except Exception as e:
+            self.stats['errors'] += 1
+            self.logger.warning(f"🌐 Deezer picture download failed for {artist_name}: {e}")
+            return False
+
+    def test_connection(self) -> dict:
+        """Verify Deezer answers, for the settings page Test button."""
+        if not self.is_enabled():
+            return {'success': False, 'message': 'Deezer cover art is disabled'}
+        artist = self.search_artist('Faithless')
+        if not artist:
+            return {'success': False, 'message': 'Deezer returned no artist match'}
+        return {
+            'success': True,
+            'message': f"Deezer OK - test match {artist.get('name')} "
+                       f"({artist.get('nb_fan', 0)} fans)",
+        }
+
+    def get_statistics(self) -> dict:
+        return dict(self.stats)
+
+
 class JellyfinAPI:
     def __init__(self, config: Config, logger: logging.Logger):
         self.config = config
@@ -1059,6 +1197,7 @@ class PlaylistGenerator:
         self.logger = logger
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
+        self.deezer = DeezerClient(config, logger)
         # Add caching for API queries to prevent repeated expensive calls
         self._artist_path_cache = {}
         self._audio_items_cache = None
@@ -2029,28 +2168,33 @@ class PlaylistGenerator:
                     else:
                         self.logger.info(f"❌ No genre-specific cover art found for playlist: {name}")
             
-                # For artist playlists, try Spotify cover art first, then fallback to custom generation
-                self.logger.debug(f"🔍 Cover art check - cover_added: {cover_added}, 'This is' in name: {'This is' in name}, spotify enabled: {self.spotify.is_enabled()}")
-                self.logger.debug(f"🔍 Spotify client status: {self.spotify.spotify is not None}")
+                # For artist playlists: Deezer (no key or account), then Spotify, then custom art
+                self.logger.debug(f"🔍 Cover art check - cover_added: {cover_added}, 'This is' in name: {'This is' in name}, deezer enabled: {self.deezer.is_enabled()}, spotify enabled: {self.spotify.is_enabled()}")
                 
                 if not cover_added and "This is" in name:
                     # Extract artist name from "This is [Artist]!" format
                     artist_name = name.replace("This is ", "").replace("!", "").strip()
                     self.logger.info(f"🎯 Extracted artist name: {artist_name}")
                     
-                    # Try Spotify cover art first if enabled
-                    if self.spotify.is_enabled():
+                    # Deezer first: public API, no credentials needed
+                    if self.deezer.is_enabled():
+                        self.logger.info(f"🎨 Attempting to apply Deezer cover art for artist playlist...")
+                        if self.deezer.get_artist_cover_art(artist_name, playlist_dir):
+                            cover_added = True
+                            self.logger.info(f"✅ Applied Deezer cover art for artist playlist: {name}")
+                        else:
+                            self.logger.info(f"❌ No Deezer cover art found for artist: {artist_name}")
+                    
+                    # Then Spotify, if it is configured
+                    if not cover_added and self.spotify.is_enabled():
                         self.logger.info(f"🎨 Attempting to apply Spotify cover art for artist playlist...")
                         if self.spotify.get_artist_cover_art(artist_name, playlist_dir):
                             cover_added = True
                             self.logger.info(f"✅ Applied Spotify cover art for artist playlist: {name}")
                         else:
                             self.logger.info(f"❌ No Spotify cover art found for artist: {artist_name}")
-                    else:
-                        self.logger.info(f"⚠️ Spotify cover art skipped - Spotify enabled: {self.spotify.is_enabled()}")
-                        self.logger.info(f"🔧 Spotify client not enabled - client status: {self.spotify.spotify is not None}")
                     
-                    # If Spotify didn't work (disabled or no cover found), try custom cover art generation
+                    # If neither worked, fall back to custom cover art generation
                     if not cover_added:
                         self.logger.info(f"🎨 Attempting custom cover art generation for artist: {artist_name}")
                         try:

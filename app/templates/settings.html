@@ -245,6 +245,12 @@
                             <input type="password" class="form-control" id="spotify_client_secret" name="spotify_client_secret" value="{{ settings.spotify_client_secret or '' }}" placeholder="Spotify Client Secret">
                         </div>
                     </div>
+                    <hr>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="deezer_cover_art_enabled" name="deezer_cover_art_enabled" {% if settings.deezer_cover_art_enabled %}checked{% endif %}>
+                        <label class="form-check-label" for="deezer_cover_art_enabled">Enable Deezer artist cover art</label>
+                    </div>
+                    <div class="form-text">Uses the public Deezer API for square artist photos. No account or API key needed, and it is tried before Spotify.</div>
                 </div>
             </div>
         </div>
@@ -320,6 +326,7 @@ function populateAllSettings() {
 
     // Spotify
     $('#spotify_cover_art_enabled').prop('checked', !!currentSettings.spotify_cover_art_enabled);
+    $('#deezer_cover_art_enabled').prop('checked', !!currentSettings.deezer_cover_art_enabled);
     $('#spotify_client_id').val(currentSettings.spotify_client_id || '');
     $('#spotify_client_secret').val(currentSettings.spotify_client_secret || '');
 }
@@ -556,6 +563,7 @@ function setupEventListeners() {
         // Ensure checkboxes that are not checked are sent as false
         settings.shuffle_tracks = $('#shuffle_tracks').is(':checked');
         settings.spotify_cover_art_enabled = $('#spotify_cover_art_enabled').is(':checked');
+        settings.deezer_cover_art_enabled = $('#deezer_cover_art_enabled').is(':checked');
         settings.auto_generate_on_startup = $('#auto_generate_on_startup').is(':checked');
         settings.genre_grouping_enabled = $('#genre_grouping_enabled').is(':checked');
 

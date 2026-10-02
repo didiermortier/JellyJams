@@ -16,7 +16,7 @@ from functools import wraps
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, Response, send_file
 from werkzeug.security import check_password_hash, generate_password_hash
 import base64
-from vibecodeplugin import Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient
+from vibecodeplugin import Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient, DeezerClient
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -82,6 +82,7 @@ class ConfigManager:
             'spotify_client_id': getattr(config, 'spotify_client_id', ''),
             'spotify_client_secret': getattr(config, 'spotify_client_secret', ''),
             'spotify_cover_art_enabled': getattr(config, 'spotify_cover_art_enabled', False),
+            'deezer_cover_art_enabled': getattr(config, 'deezer_cover_art_enabled', False),
             'enabled_genres': [],
             'enabled_years': [],
             'enabled_artists': [],
@@ -174,6 +175,7 @@ class ConfigManager:
         config.spotify_client_id = settings.get('spotify_client_id', getattr(config, 'spotify_client_id', ''))
         config.spotify_client_secret = settings.get('spotify_client_secret', getattr(config, 'spotify_client_secret', ''))
         config.spotify_cover_art_enabled = settings.get('spotify_cover_art_enabled', getattr(config, 'spotify_cover_art_enabled', False))
+        config.deezer_cover_art_enabled = settings.get('deezer_cover_art_enabled', getattr(config, 'deezer_cover_art_enabled', False))
         
         # Apply playlist generation settings
         
@@ -1076,12 +1078,14 @@ def api_update_covers():
         jellyfin_logger = setup_logging(config)
         generator = PlaylistGenerator(config, jellyfin_logger)
         spotify = SpotifyClient(config, jellyfin_logger)
+        deezer = DeezerClient(config, jellyfin_logger)
         
         # Pre-cache Spotify configuration to avoid repeated checks
         spotify_enabled = spotify.is_enabled()
         spotify_available = spotify.spotify is not None
+        deezer_enabled = deezer.is_enabled()
         
-        logger.info(f"🔍 Configuration check - Spotify enabled: {spotify_enabled}, client available: {spotify_available}")
+        logger.info(f"🔍 Configuration check - Deezer enabled: {deezer_enabled}, Spotify enabled: {spotify_enabled}, client available: {spotify_available}")
         logger.info(f"🔍 Config details - cover_art_enabled: {config.spotify_cover_art_enabled}, client_id: {bool(config.spotify_client_id)}, client_secret: {bool(config.spotify_client_secret)}")
         
         # Pre-load Jellyfin audio items cache to prevent repeated API calls
@@ -1140,9 +1144,18 @@ def api_update_covers():
                     if artist_name:
                         cover_updated = False
                         
-                        # Use pre-cached Spotify configuration (no more repeated checks!)
-                        # Try Spotify cover art first if enabled
-                        if spotify_enabled and spotify_available:
+                        # Deezer first: public API, no account or key needed
+                        if deezer_enabled:
+                            try:
+                                logger.debug(f"🎵 Attempting Deezer cover art for {artist_name}")
+                                if deezer.get_artist_cover_art(artist_name, playlist_dir):
+                                    logger.info(f"✅ Updated Deezer cover art for {artist_name}")
+                                    cover_updated = True
+                            except Exception as e:
+                                logger.debug(f"Deezer cover art failed for {artist_name}: {e}")
+                        
+                        # Then Spotify, if it is configured
+                        if not cover_updated and spotify_enabled and spotify_available:
                             try:
                                 logger.debug(f"🎵 Attempting Spotify cover art for {artist_name}")
                                 spotify_success = spotify.get_artist_cover_art(artist_name, playlist_dir)
@@ -1151,10 +1164,8 @@ def api_update_covers():
                                     cover_updated = True
                             except Exception as e:
                                 logger.debug(f"Spotify cover art failed for {artist_name}: {e}")
-                        elif not spotify_enabled:
-                            logger.debug(f"⚠️ Spotify cover art skipped for {artist_name} - not enabled")
                         
-                        # Try custom cover art generation if Spotify failed
+                        # Try custom cover art generation if both failed
                         if not cover_updated:
                             try:
                                 # Use the existing generator instance (DO NOT create new one - it destroys the cache!)
