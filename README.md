@@ -3,6 +3,16 @@
   <img src="jellyjams.jpeg" alt="JellyJams Logo" />
 </p>
 
+> **Fork note (didiermortier/JellyJams).** Upstream is unmaintained since Nov 2025. This fork
+> fixes Jellyfin 12 compatibility so it runs again on Jellyfin 12.1.
+>
+> Change: `app/vibecodeplugin.py` now authenticates with the standard
+> `Authorization: MediaBrowser Token=...` header. The old `X-Emby-Token` header that upstream
+> sends is rejected with HTTP 401 by Jellyfin 12 (the legacy auth scheme was disabled in 12.0),
+> which made every generation run abort at "Cannot connect to Jellyfin".
+>
+> Only this one line differs from upstream so the fork stays easy to re-sync.
+
 **JellyJams** is a modern, standalone Docker container that automatically generates music playlists for your Jellyfin media server using the Jellyfin REST API. It features a beautiful dark-themed web UI for easy configuration and management.
 
 ![JellyJams Web UI](https://img.shields.io/badge/Web%20UI-Modern%20Dark%20Theme-8b5cf6)

@@ -695,7 +695,10 @@ class JellyfinAPI:
         self.logger = logger
         self.session = requests.Session()
         self.session.headers.update({
-            'X-Emby-Token': config.api_key,
+            # Jellyfin 10.11 removed the legacy X-Emby-Token scheme and Jellyfin 12
+            # rejects it outright with 401. The supported form is the standard
+            # Authorization header; verified against Jellyfin 12.1.
+            'Authorization': f'MediaBrowser Token={config.api_key}',
             'Content-Type': 'application/json'
         })
 
