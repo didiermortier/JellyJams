@@ -32,6 +32,22 @@
 > 8. Each run records its outcome to `/data/run_status.json`, exposed at `GET /api/health` (503 when
 >    the last run failed) and used by the container `HEALTHCHECK`, so a failed scheduled run shows up
 >    in any monitoring tool rather than only in the log.
+> 9. Personal playlists read real play counts from the **Playback Reporting** plugin, walking only
+>    the days that have activity and counting audio plays per track. `listening_window_days`
+>    (default 90) is widened to 365 when it holds too little, then falls back to favourites and
+>    recently played exactly as upstream did, so a quiet month does not empty the playlist. A
+>    missing plugin behaves the same as no listening history.
+> 10. **Playlists JellyJams did not create are never touched.** Deletion is gated on the name being
+>    one JellyJams generates, and on `/data/managed_playlists.json`, which records the id of every
+>    playlist it creates. A same-named playlist that is not in that record is left alone and the
+>    replacement is skipped instead of being turned into a duplicate. A playlist of your own, named
+>    anything else, can never be removed. On the first run after upgrading, the generated names
+>    already on the server are adopted once, and logged, so an existing install keeps updating.
+> 11. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
+>    playlists included, and it removed only the folders: the Jellyfin items stayed and the scanner
+>    brought them back as empty playlists. That is one way playlists end up present but empty. It now
+>    deletes only generated names from the managed record, through the API, and reports what it left
+>    alone. The button reads "Delete Generated".
 
 **JellyJams** is a modern, standalone Docker container that automatically generates music playlists for your Jellyfin media server using the Jellyfin REST API. It features a beautiful dark-themed web UI for easy configuration and management.
 
