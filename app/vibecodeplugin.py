@@ -1300,6 +1300,28 @@ class JellyfinAPI:
                 'name': name
             }
 
+    def list_playlists(self, user_id: str = None) -> List[Dict]:
+        """Every playlist in the library, with the path of its folder on disk."""
+        try:
+            if not user_id:
+                users = self.get_users()
+                if not users:
+                    return []
+                user_id = users[0]['Id']
+
+            url = f"{self.config.jellyfin_url}/Users/{user_id}/Items"
+            params = {
+                'IncludeItemTypes': 'Playlist',
+                'Recursive': 'true',
+                'Fields': 'Path',
+            }
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            return response.json().get('Items', [])
+        except Exception as e:
+            self.logger.warning(f"Could not list playlists: {e}")
+            return []
+
     def find_playlists_by_name(self, name: str, user_id: str = None) -> List[Dict]:
         """Return every playlist whose name matches, so duplicates can be cleaned up.
 
@@ -1443,6 +1465,32 @@ class PlaylistGenerator:
                 self.logger.debug(f"Removed playlist folder: {target}")
         except Exception as e:
             self.logger.debug(f"Could not remove playlist folder {jellyfin_path}: {e}")
+
+    def adopt_existing_playlists(self) -> int:
+        """Record the playlists JellyJams created before it kept a record.
+
+        Runs once, only while the record is new. It adopts every existing playlist whose
+        name is one JellyJams generates, so an install that predates the bookkeeping
+        keeps updating itself, including names this run does not happen to generate.
+        Nothing else is adopted, so a hand-made playlist is never claimed.
+        """
+        if not self.bookkeeping_is_new:
+            return 0
+
+        managed = load_managed_playlists()
+        adopted = 0
+        for item in self.jellyfin.list_playlists():
+            name = item.get('Name')
+            if name and is_generated_playlist_name(name) and managed.get(name) != item.get('Id'):
+                managed[name] = item.get('Id')
+                adopted += 1
+
+        if adopted:
+            save_managed_playlists(managed)
+            self.logger.info(
+                f"📋 Adopted {adopted} playlist(s) that JellyJams created before it kept a record"
+            )
+        return adopted
 
     def _remove_existing_playlists(self, name: str, user_id: str):
         """Remove our own playlist with this name and its folder.
@@ -3077,6 +3125,7 @@ class PlaylistGenerator:
     def _generate_playlists(self):
         """Main playlist generation function. Returns counts, or None if it aborted."""
         self.created_playlists = 0
+        self.adopt_existing_playlists()
         self.logger.info("🎵 ========== STARTING JELLYJAMS PLAYLIST GENERATION ==========")
         self.logger.info(f"🔧 Configuration: Max tracks: {self.config.max_tracks_per_playlist}, Min tracks: {self.config.min_tracks_per_playlist}")
         self.logger.info(f"🔧 Playlist types: {', '.join(self.config.playlist_types)}")
