@@ -43,7 +43,7 @@
                 <i class="fas fa-image me-1"></i>Update Covers
             </button>
             <button type="button" class="btn btn-danger" onclick="deleteAllPlaylists()">
-                <i class="fas fa-trash-alt me-1"></i>Delete All
+                <i class="fas fa-trash-alt me-1"></i>Delete Generated
             </button>
         </div>
     </div>
@@ -206,34 +206,34 @@
     </div>
 </div>
 
-<!-- Delete All Confirmation Modal -->
+<!-- Delete Generated Playlists Confirmation Modal -->
 <div class="modal fade" id="deleteAllModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title text-danger">
-                    <i class="fas fa-exclamation-triangle me-2"></i>Delete All Playlists
+                    <i class="fas fa-exclamation-triangle me-2"></i>Delete Generated Playlists
                 </h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
                 <div class="alert alert-danger">
                     <i class="fas fa-exclamation-triangle me-2"></i>
-                    <strong>Warning:</strong> This will permanently delete ALL playlists!
+                    <strong>Warning:</strong> this permanently deletes the playlists JellyJams created.
                 </div>
-                <p>Are you sure you want to delete <strong>all {{ playlists|length }} playlist(s)</strong>?</p>
-                <p class="text-muted">This action cannot be undone and will remove all generated playlists from your system.</p>
+                <p>Are you sure you want to delete the generated playlists?</p>
+                <p class="text-muted">Playlists you made yourself are left alone and are not counted here. This action cannot be undone.</p>
                 <div class="form-check mt-3">
                     <input class="form-check-input" type="checkbox" id="confirmDeleteAll">
                     <label class="form-check-label" for="confirmDeleteAll">
-                        I understand this will delete all playlists permanently
+                        I understand this will delete the generated playlists permanently
                     </label>
                 </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-danger" id="confirmDeleteAllBtn" disabled>
-                    <i class="fas fa-trash-alt me-1"></i>Delete All Playlists
+                    <i class="fas fa-trash-alt me-1"></i>Delete Generated Playlists
                 </button>
             </div>
         </div>

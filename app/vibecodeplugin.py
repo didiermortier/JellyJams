@@ -745,6 +745,53 @@ def setup_logging(config: Config):
     return logger
 
 RUN_STATUS_FILE = '/data/run_status.json'
+MANAGED_PLAYLISTS_FILE = '/data/managed_playlists.json'
+
+
+def is_generated_playlist_name(name: str) -> bool:
+    """True when a name is one JellyJams itself creates.
+
+    This is the first guard before anything is deleted, so a playlist made by hand can
+    never be removed even if a generated one wants the same name. The patterns match
+    what save_playlist is called with: "<genre> Radio", "Back to the <decade>s",
+    "This is <artist>!" and the four personal mixes.
+    """
+    if not name:
+        return False
+    if name.endswith(' Radio'):
+        return True
+    if name.startswith('Back to the '):
+        return True
+    if name.startswith('This is ') and name.endswith('!'):
+        return True
+    return any(name.startswith(prefix) for prefix in
+               ('Top Tracks - ', 'Discovery Mix - ', 'Recent Favorites - ', 'Genre Mix - '))
+
+
+def load_managed_playlists() -> Dict[str, str]:
+    """Names JellyJams created, mapped to the playlist id it last wrote."""
+    try:
+        path = Path(MANAGED_PLAYLISTS_FILE)
+        if path.exists():
+            return dict((json.loads(path.read_text()) or {}).get('playlists') or {})
+    except Exception as e:
+        logging.getLogger('jellyjams').warning(f"Could not read the managed playlist list: {e}")
+    return {}
+
+
+def managed_playlists_exist() -> bool:
+    return Path(MANAGED_PLAYLISTS_FILE).exists()
+
+
+def save_managed_playlists(mapping: Dict[str, str]):
+    try:
+        path = Path(MANAGED_PLAYLISTS_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'playlists': mapping}, indent=2, sort_keys=True))
+        tmp.replace(path)
+    except Exception as e:
+        logging.getLogger('jellyjams').warning(f"Could not write the managed playlist list: {e}")
 
 
 def write_run_status(success: bool, summary: str = '', counts: Optional[Dict] = None):
@@ -1387,29 +1434,63 @@ class PlaylistGenerator:
         except Exception as e:
             self.logger.debug(f"Could not remove playlist folder {jellyfin_path}: {e}")
 
-    def _remove_existing_playlists(self, name: str, user_id: str) -> List[str]:
-        """Remove every playlist with this name and its folder, returning its tracks.
+    def _remove_existing_playlists(self, name: str, user_id: str):
+        """Remove our own playlist with this name and its folder.
 
-        Jellyfin derives the playlist folder from the playlist name and appends a number
-        when that name is taken, so a replace has to free the name first or it lands in
-        "Name1". The folder also outlives the item, and a leftover folder is re-scanned
-        into an empty duplicate. The returned track ids let a failed create be rolled
-        back, so the playlist is never simply lost.
+        Returns (rollback_track_ids, skip). Only playlists JellyJams created are removed:
+        one made by hand is left alone even when it shares a name with a generated one,
+        and the replacement is skipped rather than left as a duplicate. On the very first
+        run, generated names already present are adopted once, which is what lets an
+        install that predates this bookkeeping keep updating itself, and every adopted
+        name is logged.
+
+        Jellyfin derives the playlist folder from the name and appends a number when that
+        name is taken, so the name has to be freed before the create or it lands in
+        "Name1". The folder also outlives the item and is re-scanned into an empty
+        duplicate, so it is removed too. The returned track ids let a failed create be
+        rolled back, so the playlist is never simply lost.
         """
+        if not is_generated_playlist_name(name):
+            self.logger.warning(f"Refusing to manage '{name}': JellyJams does not generate that name")
+            return [], True
+
         existing = self.jellyfin.find_playlists_by_name(name, user_id)
         if not existing:
             self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
-            return []
+            return [], False
 
-        self.logger.info(f"Found {len(existing)} existing playlist(s) named '{name}'")
+        managed = load_managed_playlists()
+        first_run = not managed_playlists_exist()
+
+        ours, foreign = [], []
+        for item in existing:
+            if managed.get(name) == item.get('Id') or first_run:
+                ours.append(item)
+            else:
+                foreign.append(item)
+
+        if foreign:
+            self.logger.warning(
+                f"⚠️ A playlist named '{name}' exists but was not created by JellyJams. "
+                f"Leaving it untouched and skipping that name. Rename or remove it if "
+                f"JellyJams should manage it again."
+            )
+            return [], True
+
+        self.logger.info(f"Found {len(ours)} existing playlist(s) named '{name}'")
+        if first_run:
+            self.logger.info(
+                f"📋 First run with playlist bookkeeping: adopting '{name}' "
+                f"(and the other names JellyJams generates) as managed"
+            )
 
         rollback_tracks: List[str] = []
-        for item in existing:
+        for item in ours:
             ids = self._playlist_track_ids(item.get('Id'), user_id)
             if len(ids) > len(rollback_tracks):
                 rollback_tracks = ids
 
-        for item in existing:
+        for item in ours:
             playlist_id = item.get('Id')
             if self.jellyfin.delete_playlist(playlist_id):
                 self.logger.info(f"🧹 Removed previous playlist '{name}' (id {playlist_id})")
@@ -1417,7 +1498,7 @@ class PlaylistGenerator:
                 self.logger.warning(f"⚠️ Could not remove previous playlist '{name}' (id {playlist_id})")
             self._remove_playlist_folder(item.get('Path'))
 
-        return rollback_tracks
+        return rollback_tracks, False
 
     def _select_tracks(self, tracks: List[Dict]) -> List[Dict]:
         """Choose which tracks go into one playlist.
@@ -2271,7 +2352,13 @@ class PlaylistGenerator:
             # their track list, and put it back if the create then fails.
             api_name = normalize_name(name)
             self.logger.info(f"Checking for existing playlist: {api_name}")
-            rollback_tracks = self._remove_existing_playlists(api_name, user_id)
+            rollback_tracks, skip = self._remove_existing_playlists(api_name, user_id)
+            if skip:
+                self.logger.warning(
+                    f"Skipping '{api_name}': a playlist with that name exists and JellyJams "
+                    f"did not create it"
+                )
+                return None
             if rollback_tracks:
                 self.logger.info(
                     f"Replacing the existing playlist, {len(rollback_tracks)} of its "
@@ -2285,6 +2372,11 @@ class PlaylistGenerator:
             
             if result['success']:
                 self.created_playlists += 1
+                new_id = result.get('playlist_id')
+                if new_id:
+                    managed = load_managed_playlists()
+                    managed[api_name] = new_id
+                    save_managed_playlists(managed)
                 self.logger.info(f"✅ Successfully created {privacy_text} playlist '{sanitized_name}' with {result['track_count']} tracks")
                 
                 # Create directory for cover art storage (use Jellyfin-style sanitized name for filesystem)

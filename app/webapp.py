@@ -16,7 +16,9 @@ from functools import wraps
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, Response, send_file
 from werkzeug.security import check_password_hash, generate_password_hash
 import base64
-from vibecodeplugin import Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient, DeezerClient
+import shutil
+from vibecodeplugin import (Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient,
+                            DeezerClient, is_generated_playlist_name, load_managed_playlists)
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -784,42 +786,87 @@ def api_generate_personalized():
 @app.route('/api/delete_playlist', methods=['POST'])
 @requires_auth
 def api_delete_playlist():
-    """API endpoint to delete a playlist"""
+    """Delete one playlist, but only one JellyJams created.
+
+    Refuses names it does not generate, and playlists it has no record of creating, so a
+    playlist made by hand cannot be removed here. The Jellyfin item is deleted through the
+    API as well as the folder, because removing the folder alone leaves the item behind
+    for the scanner to bring back as an empty playlist.
+    """
     try:
         playlist_name = request.json.get('playlist_name')
         if not playlist_name:
             return jsonify({'success': False, 'message': 'Playlist name required'})
-        
+        if any(bad in playlist_name for bad in ('/', '\\', '..')):
+            return jsonify({'success': False, 'message': 'Invalid playlist name'})
+        if not is_generated_playlist_name(playlist_name):
+            return jsonify({'success': False,
+                            'message': 'JellyJams only deletes the playlists it generates'})
+
+        generator = PlaylistGenerator(config, setup_logging(config))
+        managed = load_managed_playlists()
+        existing = generator.jellyfin.find_playlists_by_name(playlist_name)
+        targets = [item for item in existing if managed.get(playlist_name) == item.get('Id')]
+
+        if existing and not targets:
+            return jsonify({'success': False,
+                            'message': 'That playlist was not created by JellyJams, leaving it alone'})
+
+        for item in targets:
+            generator.jellyfin.delete_playlist(item.get('Id'))
+            generator._remove_playlist_folder(item.get('Path'))
+
         playlist_dir = Path(config.playlist_folder) / playlist_name
         if playlist_dir.exists():
-            import shutil
             shutil.rmtree(playlist_dir)
-            return jsonify({'success': True, 'message': f'Deleted playlist: {playlist_name}'})
-        else:
+
+        if not targets and not playlist_dir.exists():
             return jsonify({'success': False, 'message': 'Playlist not found'})
+        return jsonify({'success': True, 'message': f'Deleted playlist: {playlist_name}'})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/delete_all_playlists', methods=['POST'])
 @requires_auth
 def api_delete_all_playlists():
-    """API endpoint to delete all playlists"""
+    """Delete the playlists JellyJams created, and leave everything else alone.
+
+    This used to remove every folder in the playlist directory, hand-made playlists
+    included, and it removed only the folders: the Jellyfin items stayed behind and the
+    scanner brought them back as empty playlists, which is how playlists end up present
+    but empty. Deletion now goes through the API as well, and only touches generated
+    names that are in the managed list.
+    """
     try:
+        generator = PlaylistGenerator(config, setup_logging(config))
         playlist_dir = Path(config.playlist_folder)
         if not playlist_dir.exists():
             return jsonify({'success': False, 'message': 'Playlist directory not found'})
-        
-        deleted_count = 0
-        for playlist_folder in playlist_dir.iterdir():
-            if playlist_folder.is_dir():
-                import shutil
-                shutil.rmtree(playlist_folder)
-                deleted_count += 1
-        
-        logger.info(f"Deleted {deleted_count} playlists")
+
+        managed = load_managed_playlists()
+        deleted, left_alone = [], []
+
+        for name in sorted(managed):
+            if not is_generated_playlist_name(name):
+                left_alone.append(name)
+                continue
+            for item in generator.jellyfin.find_playlists_by_name(name):
+                generator.jellyfin.delete_playlist(item.get('Id'))
+            folder = playlist_dir / name
+            if folder.is_dir():
+                generator._remove_playlist_folder(str(folder))
+            deleted.append(name)
+
+        for entry in playlist_dir.iterdir():
+            if entry.is_dir() and entry.name not in managed:
+                left_alone.append(entry.name)
+
+        logger.info(f"Deleted {len(deleted)} JellyJams playlists, left {len(left_alone)} alone")
         return jsonify({
-            'success': True, 
-            'message': f'Successfully deleted {deleted_count} playlists'
+            'success': True,
+            'message': f'Deleted {len(deleted)} JellyJams playlists, left {len(left_alone)} alone',
+            'deleted': deleted,
+            'left_alone': left_alone,
         })
     except Exception as e:
         logger.error(f"Error deleting all playlists: {e}")
