@@ -83,8 +83,11 @@ class Config:
         self.random_track_selection = True
         self.playlist_types = ['Genre','Year','Artist','Personal']
         
-        # Playlist diversity settings
-        self.min_artist_diversity = 5
+        # Playback Reporting: how far back to look for play counts when building
+        # personal playlists. A window that is too short leaves "Top Tracks" empty for
+        # anyone who does not listen every week, so the code widens once before falling
+        # back to favourites.
+        self.listening_window_days = 90
         
         # Spotify API configuration (optional)
         self.spotify_client_id = ''
@@ -99,6 +102,9 @@ class Config:
         self.personal_playlist_new_users_default = True
         self.personal_playlist_min_user_tracks = 10
         
+        # Playlist diversity settings
+        self.min_artist_diversity = 5
+
         # Discovery playlist diversity settings
         self.discovery_max_songs_per_album = 1
         self.discovery_max_songs_per_artist = 2
@@ -183,6 +189,8 @@ class Config:
                     self.discovery_max_songs_per_album = int(web_settings['discovery_max_songs_per_album'])
                 if 'discovery_max_songs_per_artist' in web_settings:
                     self.discovery_max_songs_per_artist = int(web_settings['discovery_max_songs_per_artist'])
+                if 'listening_window_days' in web_settings:
+                    self.listening_window_days = int(web_settings['listening_window_days'])
                 if 'min_albums_per_artist' in web_settings:
                     self.min_albums_per_artist = int(web_settings['min_albums_per_artist'])
                 if 'min_albums_per_decade' in web_settings:
@@ -1019,45 +1027,77 @@ class JellyfinAPI:
             self.logger.error(f"Error fetching users: {e}")
             return []
 
-    def get_user_listening_stats(self, user_id: str, limit: int = 100) -> List[Dict]:
-        """Get user's most played tracks using Jellyfin's playback reporting"""
+    def get_playback_active_dates(self, user_id: str, days: int) -> List[str]:
+        """Dates in the last `days` on which this user played anything, newest first.
+
+        Raises RuntimeError when the Playback Reporting plugin is absent, so the caller
+        can tell "no plugin" from "no listening", and returns [] for the latter.
+        """
+        url = f"{self.config.jellyfin_url}/user_usage_stats/PlayActivity"
+        response = self.session.get(url, params={'days': days}, timeout=30)
+        if response.status_code == 404:
+            raise RuntimeError("Playback Reporting plugin not installed")
+        response.raise_for_status()
+
+        data = response.json()
+        if not isinstance(data, list):
+            return []
+        # One entry per user that has any activity; user_usage maps date -> play count.
+        for entry in data:
+            if entry.get('user_id') == user_id:
+                usage = entry.get('user_usage') or {}
+                return sorted((d for d, n in usage.items() if isinstance(n, (int, float)) and n > 0),
+                              reverse=True)
+        return []
+
+    def get_user_play_counts(self, user_id: str, days: int, max_dates: int = 200) -> Dict[str, int]:
+        """Play counts per item for one user over a window, from Playback Reporting.
+
+        The plugin reports activity per user per day and the items played on one day, but
+        has no endpoint that returns "most played tracks" in one call, so this walks only
+        the days that actually have activity. Returns {} when the plugin is missing, when
+        the user has no activity in the window, or on any error, which is what keeps the
+        caller's favourites and recently-played fallbacks working unchanged.
+        """
+        counts: Dict[str, int] = {}
         try:
-            # Try to get playback statistics from Jellyfin
-            # Note: This requires the 'playback_reporting' plugin to be installed
-            url = f"{self.config.jellyfin_url}/user_usage_stats/PlayActivity"
-            params = {
-                'user_id': user_id,
-                'limit': limit,
-                'media_type': 'Audio'
-            }
-            
-            self.logger.debug(f"Attempting to get listening stats from: {url}")
-            response = self.session.get(url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list) and data:
-                    self.logger.info(f"✅ Retrieved {len(data)} listening stats for user {user_id}")
-                    return data
-                else:
-                    self.logger.info(f"📊 Listening stats endpoint available but no data returned for user {user_id}")
-                    return []
-            elif response.status_code == 404:
-                self.logger.info(f"📊 Playback reporting plugin not installed or endpoint not available (404)")
-                return []
-            else:
-                self.logger.warning(f"📊 Playback reporting request failed (status: {response.status_code})")
-                return []
-                
-        except requests.exceptions.Timeout:
-            self.logger.warning(f"⏱️ Timeout getting listening stats for user {user_id}")
-            return []
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(f"🌐 Network error getting listening stats for user {user_id}: {e}")
-            return []
+            active_dates = self.get_playback_active_dates(user_id, days)
+        except RuntimeError as e:
+            self.logger.info(f"📊 {e}, using favourites instead of play counts")
+            return {}
         except Exception as e:
-            self.logger.warning(f"❌ Unexpected error getting listening stats for user {user_id}: {e}")
-            return []
+            self.logger.warning(f"📊 Playback Reporting unavailable: {e}")
+            return {}
+
+        if not active_dates:
+            self.logger.info(f"📊 No playback activity in the last {days} days")
+            return {}
+
+        dates = active_dates[:max_dates]
+        if len(active_dates) > max_dates:
+            self.logger.info(f"📊 {len(active_dates)} active days in {days} days, reading the newest {max_dates}")
+
+        base = f"{self.config.jellyfin_url}/user_usage_stats"
+        for date in dates:
+            try:
+                response = self.session.get(f"{base}/{user_id}/{date}/GetItems", timeout=30)
+                if response.status_code != 200:
+                    continue
+                # Each row is one play event: Id is the item, Type separates audio from video.
+                for row in response.json() or []:
+                    if (row.get('Type') or '') != 'Audio':
+                        continue
+                    item_id = row.get('Id')
+                    if item_id:
+                        counts[item_id] = counts.get(item_id, 0) + 1
+            except Exception as e:
+                self.logger.debug(f"📊 Could not read playback for {date}: {e}")
+
+        self.logger.info(
+            f"📊 Playback Reporting: {len(counts)} distinct tracks over "
+            f"{len(dates)} active day(s) in the last {days} days"
+        )
+        return counts
 
     def get_user_favorite_items(self, user_id: str) -> List[Dict]:
         """Get user's favorite/liked items"""
@@ -2708,31 +2748,47 @@ class PlaylistGenerator:
             self.logger.info(f"Generating top tracks playlist for {user_name}...")
             top_tracks = []
             
-            # Try multiple methods to get user's top tracks
-            # Method 1: Try to get listening stats (may not be available in all Jellyfin setups)
-            try:
-                listening_stats = self.jellyfin.get_user_listening_stats(user_id, limit=50)
-                if listening_stats:
-                    self.logger.info(f"Found {len(listening_stats)} listening stats for {user_name}")
-                    # Extract track IDs from listening stats and find corresponding tracks
-                    stats_track_ids = {stat.get('ItemId') for stat in listening_stats if stat.get('ItemId')}
-                    
-                    for track in audio_items:
-                        if track.get('Id') in stats_track_ids:
-                            # Add play count from stats
-                            for stat in listening_stats:
-                                if stat.get('ItemId') == track.get('Id'):
-                                    track['play_count'] = stat.get('PlayCount', 0)
-                                    break
-                            top_tracks.append(track)
-                    
-                    # Sort by play count
-                    top_tracks.sort(key=lambda x: x.get('play_count', 0), reverse=True)
-                    self.logger.info(f"Using listening stats - found {len(top_tracks)} tracks with play counts")
+            # Method 1: real play counts from the Playback Reporting plugin, if present.
+            # The window is read at the configured size and widened once when it holds too
+            # little, because nobody listens every week and a short window would leave this
+            # playlist empty. With no plugin, or too thin a history, nothing is set here and
+            # the favourites and recently-played fallbacks below behave exactly as before.
+            windows = [w for w in dict.fromkeys([self.config.listening_window_days, 365]) if w and w > 0]
+            for index, window in enumerate(windows):
+                try:
+                    counts = self.jellyfin.get_user_play_counts(user_id, days=window)
+                except Exception as stats_e:
+                    self.logger.warning(f"Could not read play counts for {user_name}: {stats_e}")
+                    counts = {}
+
+                if counts:
+                    by_id = {track.get('Id'): track for track in audio_items if track.get('Id')}
+                    played = []
+                    for item_id, count in counts.items():
+                        track = by_id.get(item_id)
+                        if track:
+                            track = dict(track)  # the library list is cached and shared
+                            track['play_count'] = count
+                            played.append(track)
+                    played.sort(key=lambda t: t['play_count'], reverse=True)
+
+                    if len(played) >= self.config.min_tracks_per_playlist:
+                        top_tracks = played[:self.config.max_tracks_per_playlist]
+                        self.logger.info(
+                            f"Using play counts from the last {window} days - {len(played)} of the "
+                            f"played tracks are still in the library"
+                        )
+                        break
+
+                    self.logger.info(
+                        f"Only {len(played)} played tracks within {window} days, "
+                        f"minimum is {self.config.min_tracks_per_playlist}"
+                    )
+
+                if index < len(windows) - 1:
+                    self.logger.info(f"Widening the play-count window past {window} days")
                 else:
-                    self.logger.info(f"No listening stats returned for {user_name}")
-            except Exception as stats_e:
-                self.logger.warning(f"Could not get listening stats for {user_name}: {stats_e}")
+                    self.logger.info("Not enough play history for a Top Tracks playlist, using fallbacks")
             
             # Method 2: Fallback to favorite tracks if no listening stats available
             if not top_tracks:

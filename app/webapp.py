@@ -90,6 +90,7 @@ class ConfigManager:
             'personal_playlist_min_user_tracks': getattr(config, 'personal_playlist_min_user_tracks', 10),
             'discovery_max_songs_per_album': getattr(config, 'discovery_max_songs_per_album', 1),
             'discovery_max_songs_per_artist': getattr(config, 'discovery_max_songs_per_artist', 2),
+            'listening_window_days': getattr(config, 'listening_window_days', 90),
             'min_albums_per_artist': getattr(config, 'min_albums_per_artist', 2),
             'min_albums_per_decade': getattr(config, 'min_albums_per_decade', 3),
             'trigger_library_scan': getattr(config, 'trigger_library_scan', True),
@@ -188,6 +189,10 @@ class ConfigManager:
             pass
         try:
             config.min_albums_per_decade = int(settings.get('min_albums_per_decade', getattr(config, 'min_albums_per_decade', 3)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            config.listening_window_days = int(settings.get('listening_window_days', getattr(config, 'listening_window_days', 90)))
         except (TypeError, ValueError):
             pass
         

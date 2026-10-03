@@ -288,6 +288,11 @@
                         <label class="form-check-label" for="random_track_selection">Pick a random selection each run</label>
                         <div class="form-text">When a genre or decade holds more tracks than the maximum, take a random sample instead of always the same first tracks. Recommended on, otherwise a scheduled run selects the same songs every time.</div>
                     </div>
+                    <div class="mb-3">
+                        <label for="listening_window_days" class="form-label">Play count look-back (days)</label>
+                        <input type="number" class="form-control" id="listening_window_days" name="listening_window_days" value="{{ settings.listening_window_days or 90 }}" min="1" max="3650">
+                        <div class="form-text">How far back to read play counts from the Playback Reporting plugin for the personal playlists. If that window holds too few tracks, the last 365 days are tried before falling back to favourites. Without the plugin this is ignored.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -339,6 +344,7 @@ function populateAllSettings() {
     $('#log_level').val(currentSettings.log_level || 'INFO');
     $('#shuffle_tracks').prop('checked', !!currentSettings.shuffle_tracks);
     $('#random_track_selection').prop('checked', currentSettings.random_track_selection !== false);
+    $('#listening_window_days').val(currentSettings.listening_window_days || 90);
 
     // Spotify
     $('#spotify_cover_art_enabled').prop('checked', !!currentSettings.spotify_cover_art_enabled);
