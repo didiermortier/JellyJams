@@ -760,7 +760,7 @@ def is_generated_playlist_name(name: str) -> bool:
         return False
     if name.endswith(' Radio'):
         return True
-    if name.startswith('Back to the '):
+    if re.match(r'^Back to the \d+s$', name):
         return True
     if name.startswith('This is ') and name.endswith('!'):
         return True
@@ -779,8 +779,14 @@ def load_managed_playlists() -> Dict[str, str]:
     return {}
 
 
-def managed_playlists_exist() -> bool:
-    return Path(MANAGED_PLAYLISTS_FILE).exists()
+def playlist_bookkeeping_is_new() -> bool:
+    """True when JellyJams has no record yet of the playlists it created.
+
+    Read once per run, in PlaylistGenerator.__init__, because the record file is written
+    as soon as that run creates its first playlist and every later playlist in the same
+    run still needs to know that the install predates the bookkeeping.
+    """
+    return not Path(MANAGED_PLAYLISTS_FILE).exists()
 
 
 def save_managed_playlists(mapping: Dict[str, str]):
@@ -1369,6 +1375,10 @@ class PlaylistGenerator:
     def __init__(self, config: Config, logger):
         self.config = config
         self.logger = logger
+        # Decided once per run, before this run creates anything: the record file is
+        # written as soon as the first playlist is created, and every later playlist in
+        # the same run still has to know whether the install predates the bookkeeping.
+        self.bookkeeping_is_new = playlist_bookkeeping_is_new()
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
@@ -1460,7 +1470,7 @@ class PlaylistGenerator:
             return [], False
 
         managed = load_managed_playlists()
-        first_run = not managed_playlists_exist()
+        first_run = self.bookkeeping_is_new
 
         ours, foreign = [], []
         for item in existing:
