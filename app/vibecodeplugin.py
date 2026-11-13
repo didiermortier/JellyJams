@@ -22,13 +22,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from io import BytesIO
 
-# PIL/Pillow imports for custom cover art generation
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageEnhance
-    import numpy as np
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+# Pillow is a hard requirement: the genre cover fallback draws with it.
+from PIL import Image
 
 from genre_cover import find_cover, render_genre_cover
 
@@ -484,8 +479,13 @@ class SpotifyClient:
             return
             
         try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
+            try:
+                import spotipy
+                from spotipy.oauth2 import SpotifyClientCredentials
+            except ImportError:
+                self.logger.warning("Spotify support needs the spotipy package, which this image does not include. "
+                                    "Set SPOTIPY_ENABLED=false or add spotipy to the image.")
+                return
             
             self.logger.info("Initializing Spotify API client...")
             client_credentials_manager = SpotifyClientCredentials(
@@ -2298,204 +2298,31 @@ class PlaylistGenerator:
             return ''.join(char for char in text if ord(char) < 128)
     
     def _generate_custom_cover_art(self, source_image: bytes, artist_name: str, destination: Path) -> bool:
-        """Generate custom cover art with 'This is <artist>' text overlay using multi-stage scaling approach"""
-        try:
-            import signal
-            import time
-            
-            start_time = time.time()
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Cover art generation timed out")
-            
-            # Set timeout to prevent worker crashes - reduced to 10 seconds for faster processing
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)  # 10 second timeout
-            
-            # Open the source image
-            with Image.open(BytesIO(source_image)) as img:
-                # Convert to RGB if needed
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # Create a copy to work with
-                cover_img = img.copy()
-                
-                # Resize to smaller cover art size (350x350) for better text proportion
-                cover_img.thumbnail((350, 350), Image.Resampling.LANCZOS)
-                
-                # Create a new 350x350 image with the resized image centered
-                final_img = Image.new('RGB', (350, 350), (0, 0, 0))
-                
-                # Calculate position to center the image
-                x = (350 - cover_img.width) // 2
-                y = (350 - cover_img.height) // 2
-                final_img.paste(cover_img, (x, y))
-                
-                # Create drawing context
-                draw = ImageDraw.Draw(final_img)
-                
-                # Use extremely massive font size - 4x bigger again as requested (960pt)
-                font_size = 960  # Extremely massive font size for 350x350 canvas to match reference
-                font = None
-                
-                # Use a completely different approach - create large text by scaling
-                # Start with a reasonable font size that we know works, then scale the image
-                base_font_size = 80  # Use a size we know renders properly
-                font = None
-                
-                # Try to load a system font at base size
-                try:
-                    # Try to find a system font
-                    system_fonts = [
-                        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',  # Linux
-                        '/System/Library/Fonts/Helvetica.ttc',  # macOS
-                        'arial.ttf',  # Windows fallback
-                    ]
-                    
-                    for font_path in system_fonts:
-                        try:
-                            font = ImageFont.truetype(font_path, base_font_size)
-                            self.logger.debug(f"Using system font: {font_path} at {base_font_size}pt")
-                            break
-                        except:
-                            continue
-                            
-                except Exception as font_e:
-                    self.logger.warning(f"Could not load system fonts: {font_e}")
-                
-                # If no system font, try default
-                if font is None:
-                    try:
-                        font = ImageFont.load_default()
-                        self.logger.debug(f"Using default font at base size")
-                    except Exception:
-                        self.logger.error("Could not load any font")
-                        return False
-                
-                
-                # Determine text color based on background brightness
-                text_color = self._get_adaptive_text_color(final_img)
-                
-                # Define the text lines for "This is [Artist]" overlay
-                line1 = "This is"
-                # Sanitize artist name to handle Unicode characters that fonts can't render
-                line2 = self._sanitize_text_for_font(artist_name)
-                
-                # Calculate text dimensions on large canvas
-                if font:
-                    bbox1 = draw.textbbox((0, 0), line1, font=font)
-                    bbox2 = draw.textbbox((0, 0), line2, font=font)
-                    
-                    line1_width = bbox1[2] - bbox1[0]
-                    line1_height = bbox1[3] - bbox1[1]
-                    line2_width = bbox2[2] - bbox2[0]
-                    line2_height = bbox2[3] - bbox2[1]
-                    
-                    max_width = max(line1_width, line2_width)
-                    total_height = line1_height + line2_height + 5  # Minimum spacing between lines
-                else:
-                    # Fallback estimates
-                    line1_height = 80
-                    line2_height = 80
-                    total_height = 200
-                    max_width = 600
-                
-                # Create a large text canvas for high-quality text rendering
-                text_canvas_size = 1000  # Large canvas for high-quality text
-                text_img = Image.new('RGBA', (text_canvas_size, text_canvas_size), (0, 0, 0, 0))
-                text_draw = ImageDraw.Draw(text_img)
-                
-                # Position text on large canvas (centered for now, we'll position the final result)
-                text_x = 50  # Left margin on large canvas
-                start_y = (text_canvas_size - total_height) // 2
-                
-                line1_y = start_y
-                line2_y = start_y + line1_height + 5  # Minimum spacing between lines
-                
-                # Draw text on large canvas
-                text_draw.text((text_x, line1_y), line1, fill=text_color, font=font)
-                text_draw.text((text_x, line2_y), line2, fill=text_color, font=font)
-                
-                # Crop the text area to remove excess transparent space
-                bbox = text_img.getbbox()
-                if bbox:
-                    text_img = text_img.crop(bbox)
-                
-                # Scale the text to be much larger - this is where we get the massive size
-                scale_factor = 3.0  # Make text 3x larger
-                new_width = int(text_img.width * scale_factor)
-                new_height = int(text_img.height * scale_factor)
-                text_img = text_img.resize((new_width, new_height), Image.LANCZOS)
-                
-                # Position the scaled text on the final image (bottom left)
-                paste_x = 20  # Left margin
-                paste_y = 350 - new_height - 30  # Bottom alignment with margin
-                
-                # Ensure text fits within image bounds
-                if paste_y < 0:
-                    paste_y = 10
-                if paste_x + new_width > 350:
-                    # Scale down if too wide
-                    scale_factor = (350 - 40) / text_img.width
-                    new_width = int(text_img.width * scale_factor)
-                    new_height = int(text_img.height * scale_factor)
-                    text_img = text_img.resize((new_width, new_height), Image.LANCZOS)
-                    paste_y = 350 - new_height - 30
-                
-                # Paste the text onto the final image
-                final_img.paste(text_img, (paste_x, paste_y), text_img)
-                
-                # Save the final image as PNG
-                final_img.save(destination, 'webp')
-                
-                # Clear timeout
-                signal.alarm(0)
-                
-                self.logger.info(f" Generated custom cover art with text overlay: {line1} {line2}")
-                return True
-                
-        except ImportError:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error("❌ Pillow library not available. Install with: pip install Pillow")
-            return False
-        except TimeoutError:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error("❌ Cover art generation timed out after 30 seconds")
-            return False
-        except Exception as e:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error(f"❌ Error generating custom cover art: {e}")
-            import traceback
-            self.logger.debug(f"Full traceback: {traceback.format_exc()}")
-            return False
-    
-    def _get_adaptive_text_color(self, image: 'Image') -> tuple:
-        """Determine text color (black or white) based on background brightness"""
-        try:
-            # Sample the bottom area where text will be placed
-            bottom_area = image.crop((0, 480, 600, 600))  # Bottom 120px
-            
-            # Calculate average brightness
-            import numpy as np
-            img_array = np.array(bottom_area)
-            
-            # Calculate luminance using standard formula
-            luminance = np.mean(img_array[:, :, 0] * 0.299 + 
-                              img_array[:, :, 1] * 0.587 + 
-                              img_array[:, :, 2] * 0.114)
-            
-            # Return white text for dark backgrounds, black for light backgrounds
-            if luminance < 128:
-                return (255, 255, 255)  # White text
-            else:
-                return (0, 0, 0)  # Black text
-                
-        except Exception as e:
-            self.logger.debug(f"Error calculating adaptive text color: {e}")
-            # Default to white text with shadow
-            return (255, 255, 255)
+        """Artist cover: the artist's photo in the artist's own colour, name on top.
 
+        Same treatment as the genre covers (see genre_cover.render_genre_cover), drawn with
+        the bundled font. Replaces the old renderer, which looked for system fonts the
+        Alpine image does not ship and computed a font size for a canvas twice as large.
+        """
+        tmp_bg = Path(str(destination) + '.bg.jpg')
+        tmp_out = destination.with_suffix(destination.suffix + '.tmp' + destination.suffix)
+        try:
+            with Image.open(BytesIO(source_image)) as source:
+                source.convert('RGB').save(tmp_bg, 'JPEG', quality=90)
+            render_genre_cover(tmp_bg, artist_name, tmp_out)
+            os.replace(tmp_out, destination)
+            self.logger.info(f"✅ Generated artist cover art: {destination}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error generating artist cover art for {artist_name}: {e}")
+            return False
+        finally:
+            for junk in (tmp_bg, tmp_out):
+                try:
+                    junk.unlink()
+                except OSError:
+                    pass
+    
     def _apply_discovery_diversity_controls(self, tracks: List[Dict]) -> List[Dict]:
         """Apply diversity controls to discovery playlist: limit songs per album and per artist"""
         try:

@@ -9,6 +9,7 @@ import json
 import logging
 import requests
 from datetime import datetime
+import copy
 from pathlib import Path
 from typing import Dict, List
 from collections import deque
@@ -793,6 +794,49 @@ def api_generate_personalized():
         discord_notifier.send_playlist_summary({}, [str(e)])
         
         return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/dry_run', methods=['POST'])
+@requires_auth
+def api_dry_run():
+    """Preview one run: create / replace / skip / retire, without writing anything.
+
+    Runs the generator with dry_run on, in this process, against the live server. The
+    generator refuses every write in that mode, so this is a read-only preview.
+    """
+    try:
+        dry_config = copy.copy(config)
+        dry_config.dry_run = True
+        if request.is_json and request.get_json(silent=True):
+            adopt = request.get_json(silent=True).get('adopt_existing_playlists')
+            if adopt is not None:
+                dry_config.adopt_existing_playlists = bool(adopt)
+        generator = PlaylistGenerator(dry_config, setup_logging(dry_config))
+        generator.generate_playlists()
+        report = generator.dry_run_report()
+        logger.info(f"🔎 Dry run from the web UI: {len(report['plan'])} planned, "
+                    f"{len(report['retire'])} to retire, {len(report['unrecorded_generated'])} unrecorded")
+        return jsonify({'success': True, 'report': report})
+    except Exception as e:
+        logger.error(f"Dry run failed: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/retire_stale', methods=['POST'])
+@requires_auth
+def api_retire_stale():
+    """Remove the generated playlists this run no longer makes (see plan_retirement)."""
+    try:
+        retire_config = copy.copy(config)
+        retire_config.retire_stale_playlists = True
+        generator = PlaylistGenerator(retire_config, setup_logging(retire_config))
+        generator.generate_playlists()
+        logger.info("🧹 Retire-stale run from the web UI finished")
+        return jsonify({'success': True,
+                        'message': 'Retire pass finished; the log shows what was removed'})
+    except Exception as e:
+        logger.error(f"Retire-stale run failed: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/delete_playlist', methods=['POST'])
 @requires_auth
@@ -1698,4 +1742,4 @@ def get_jellyfin_metadata(jellyfin_api):
 
 if __name__ == '__main__':
     WEB_PORT = int(os.getenv('WEB_PORT', '5000'))
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=True)
+    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)

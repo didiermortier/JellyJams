@@ -187,3 +187,24 @@ def test_sync_creates_the_data_folder(tmp_path):
 
     assert run_sync(src, tmp_path / "new" / "cover").returncode == 0
     assert (tmp_path / "new" / "cover" / "A B Radio.jpg").exists()
+
+
+# ---- artist covers --------------------------------------------------------------
+
+def test_artist_cover_is_drawn_from_the_artists_photo(plugin, tmp_path, monkeypatch):
+    from io import BytesIO
+    buf = BytesIO()
+    Image.new("RGB", (400, 400), (120, 40, 200)).save(buf, "JPEG")
+    gen, _, folder = make_generator(plugin, tmp_path, monkeypatch)
+
+    assert gen._generate_custom_cover_art(buf.getvalue(), "Nora en Pure", folder / "cover.webp")
+    with Image.open(folder / "cover.webp") as image:
+        assert image.size == (600, 600)
+    assert not (folder / "cover.webp.tmp.webp").exists() and not (folder / "cover.webp.bg.jpg").exists()
+
+
+def test_artist_cover_fails_cleanly_on_a_broken_photo(plugin, tmp_path, monkeypatch):
+    gen, _, folder = make_generator(plugin, tmp_path, monkeypatch)
+
+    assert gen._generate_custom_cover_art(b"not an image", "Nobody", folder / "cover.webp") is False
+    assert not (folder / "cover.webp").exists()

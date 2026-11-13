@@ -65,7 +65,13 @@
 >    name, are retired; personal mixes, hand-made playlists and any kind of playlist the run made none
 >    of are never touched. To clean up an install that has no record yet, run with
 >    `ADOPT_EXISTING_PLAYLISTS=true`: the dry run then shows exactly what adopting and retiring would do.
-> 14. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
+> 14. **Preview from the dashboard.** The "Preview (dry run)" button on the dashboard shows what the
+>    next run would create, replace, skip and retire, and changes nothing. `POST /api/dry_run` does the
+>    same, and `POST /api/retire_stale` runs one retire pass.
+> 15. **One process, fewer dependencies.** The container runs the web UI as a single process, so the
+>    generator and the UI share `/data/run_status.json`. `requirements.txt` lists only what the code
+>    imports. Artist covers use the same renderer and bundled font as the genre covers.
+> 16. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
 >    playlists included, and it removed only the folders: the Jellyfin items stayed and the scanner
 >    brought them back as empty playlists. That is one way playlists end up present but empty. It now
 >    deletes only generated names from the managed record, through the API, and reports what it left

@@ -187,6 +187,9 @@
                     <button class="btn btn-success" onclick="generatePlaylists()">
                         <i class="fas fa-play me-1"></i>Generate Playlists
                     </button>
+                    <button class="btn btn-outline-secondary" onclick="dryRun()">
+                        <i class="fas fa-eye me-1"></i>Preview (dry run)
+                    </button>
                     <button class="btn btn-info" onclick="generatePersonalizedPlaylists()">
                         <i class="fas fa-user-music me-1"></i>Generate Personal Playlists
                     </button>
@@ -195,6 +198,11 @@
         </div>
     </div>
 </div>
+
+<div class="modal fade" id="modal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title" id="modalTitle"></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body" id="modalBody"></div>
+</div></div></div>
 {% endblock %}
 
 {% block scripts %}
@@ -239,6 +247,46 @@ function generatePlaylists() {
     }).fail(function() {
         hideSpinner(button, originalText);
         showAlert('Error generating playlists.', 'danger');
+    });
+}
+
+function dryRun() {
+    const button = $('button[onclick="dryRun()"]');
+    const originalText = button.html();
+    button.prop('disabled', true);
+    button.html('<i class="fas fa-spinner fa-spin me-1"></i>Previewing...');
+
+    $.ajax({
+        url: '/api/dry_run',
+        method: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({adopt_existing_playlists: false}),
+        success: function(data) {
+            button.prop('disabled', false);
+            button.html(originalText);
+            if (!data.success) { showAlert('Preview failed: ' + data.message, 'danger'); return; }
+            const r = data.report;
+            const groups = [['create', 'Would CREATE'], ['replace', 'Would REPLACE (created by JellyJams)'],
+                            ['skip', 'Would SKIP (someone else made that name)']];
+            let html = '<div class="text-start" style="max-height:60vh;overflow:auto">';
+            groups.forEach(function(g) {
+                const items = r.plan.filter(function(p) { return p.action === g[0]; });
+                html += '<h6 class="mt-2">' + g[1] + ': ' + items.length + '</h6>';
+                items.forEach(function(p) { html += '<div class="small text-muted">' + p.name + ' <span class="badge bg-secondary">' + p.type + ', ' + p.tracks + ' tracks</span></div>'; });
+            });
+            html += '<h6 class="mt-2">Would RETIRE (no longer generated): ' + r.retire.length + '</h6>';
+            r.retire.forEach(function(e) { html += '<div class="small text-muted">' + e.name + '</div>'; });
+            html += '<h6 class="mt-2">Generated-looking, not in the record, left alone: ' + r.unrecorded_generated.length + '</h6>';
+            html += '<div class="small mt-2">Nothing was changed. Run it for real with Generate Playlists.</div></div>';
+            $('#modalBody').html(html);
+            $('#modalTitle').text('Dry run preview');
+            new bootstrap.Modal($('#modal')[0]).show();
+        },
+        error: function() {
+            button.prop('disabled', false);
+            button.html(originalText);
+            showAlert('Error running the preview.', 'danger');
+        }
     });
 }
 
