@@ -30,8 +30,11 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+from genre_cover import find_cover, render_genre_cover
+
 # Configuration
 SETTINGS_FILE = '/data/config/settings.json'
+COVER_SOURCE_DIR = '/data/cover'
 
 # --- Name normalization helper ---
 def normalize_name(s: str) -> str:
@@ -1879,7 +1882,7 @@ class PlaylistGenerator:
     def copy_custom_cover_art(self, playlist_name: str, playlist_dir: Path) -> bool:
         """Copy custom cover art from /app/cover/ directory with fallback system and extension preservation"""
         try:
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             self.logger.info(f"Looking for custom cover art for playlist: {playlist_name}")
             self.logger.info(f"Checking cover source directory: {cover_source_dir}")
             
@@ -1989,7 +1992,7 @@ class PlaylistGenerator:
             decade = playlist_name.replace("Back to the ", "").strip()
             self.logger.info(f"🗓️ Looking for decade-specific cover art for: {decade}")
             
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             
             if not cover_source_dir.exists():
                 self.logger.warning(f"Cover source directory does not exist: {cover_source_dir}")
@@ -2059,23 +2062,18 @@ class PlaylistGenerator:
         try:
             self.logger.info(f"🎵 Looking for genre cover art for: {genre_name}")
             
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             
             if not cover_source_dir.exists():
                 self.logger.warning(f"Cover source directory does not exist: {cover_source_dir}")
                 return False
             
-            # First, try to find predefined genre cover art
-            names = [f"{genre_name} Radio", genre_name]
+            # First, try to find predefined genre cover art. Case does not matter: genre
+            # names come from the library's tags, and file names on Linux are case sensitive.
             exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.avif']
-            source_image = None
-            for base in names:
-                for ext in exts:
-                    potential_file = cover_source_dir / f"{base}{ext}"
-                    if potential_file.exists() and potential_file.is_file():
-                        source_image = potential_file
-                        self.logger.info(f"🖼️ Found predefined genre cover art: {source_image}")
-                        break
+            source_image = find_cover(cover_source_dir, [f"{genre_name} Radio", genre_name])
+            if source_image:
+                self.logger.info(f"🖼️ Found predefined genre cover art: {source_image}")
             
             # If predefined cover found, copy it directly
             if source_image:
@@ -2130,93 +2128,13 @@ class PlaylistGenerator:
             return False
     
     def _generate_genre_cover_art(self, background_path: Path, genre_name: str, destination: Path) -> bool:
-        """Generate genre cover art with centered text overlay on background template"""
+        """Draw a cover for a genre that has none shipped: see genre_cover.render_genre_cover"""
         try:
-            from PIL import Image, ImageDraw, ImageFont
-            
-            self.logger.info(f"🎨 Generating genre cover art: {genre_name} on {background_path}")
-            
-            # Open and resize background image to standard size
-            with Image.open(background_path) as background:
-                # Convert to RGB if necessary
-                if background.mode != 'RGB':
-                    background = background.convert('RGB')
-                
-                # Resize to standard cover art size
-                cover_size = (600, 600)
-                background = background.resize(cover_size, Image.Resampling.LANCZOS)
-                
-                # Create drawing context
-                draw = ImageDraw.Draw(background)
-                
-                # Try to load a bold font, fallback to default
-                try:
-                    # Try to find a system font
-                    font_size = 400  # 5x bigger than original 80
-                    font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", font_size)
-                except:
-                    try:
-                        # Alternative system font paths
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                    except:
-                        # Fallback to default font
-                        font = ImageFont.load_default()
-                        self.logger.warning("Using default font for genre cover art")
-                
-                # Prepare text lines
-                line1 = genre_name.upper()
-                line2 = "RADIO"
-                
-                # Get text dimensions for centering
-                bbox1 = draw.textbbox((0, 0), line1, font=font)
-                bbox2 = draw.textbbox((0, 0), line2, font=font)
-                
-                text1_width = bbox1[2] - bbox1[0]
-                text1_height = bbox1[3] - bbox1[1]
-                text2_width = bbox2[2] - bbox2[0]
-                text2_height = bbox2[3] - bbox2[1]
-                
-                # Calculate centered positions
-                img_width, img_height = cover_size
-                
-                # Position text in center with some spacing between lines
-                line_spacing = 20
-                total_text_height = text1_height + text2_height + line_spacing
-                
-                y_start = (img_height - total_text_height) // 2
-                
-                x1 = (img_width - text1_width) // 2
-                y1 = y_start
-                
-                x2 = (img_width - text2_width) // 2
-                y2 = y_start + text1_height + line_spacing
-                
-                # Draw text with white color and black outline for visibility
-                outline_width = 3
-                text_color = "white"
-                outline_color = "black"
-                
-                # Draw outline by drawing text in multiple positions
-                for adj_x in range(-outline_width, outline_width + 1):
-                    for adj_y in range(-outline_width, outline_width + 1):
-                        if adj_x != 0 or adj_y != 0:
-                            draw.text((x1 + adj_x, y1 + adj_y), line1, font=font, fill=outline_color)
-                            draw.text((x2 + adj_x, y2 + adj_y), line2, font=font, fill=outline_color)
-                
-                # Draw main text
-                draw.text((x1, y1), line1, font=font, fill=text_color)
-                draw.text((x2, y2), line2, font=font, fill=text_color)
-                
-                # Save the final image
-                background.save(destination, "JPEG", quality=85)
-                
-                self.logger.info(f"✅ Generated genre cover art: {destination}")
-                return True
-                
+            render_genre_cover(background_path, genre_name, destination)
+            self.logger.info(f"✅ Generated genre cover art: {destination}")
+            return True
         except Exception as e:
-            self.logger.error(f"Error generating genre cover art: {e}")
-            import traceback
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(f"Error generating genre cover art for {genre_name}: {e}")
             return False
     
     def _try_artist_folder_fallback(self, playlist_name: str, playlist_dir: Path) -> bool:
@@ -2649,7 +2567,7 @@ class PlaylistGenerator:
         return sanitized
     
     def _jellyfin_playlist_dir(self, playlist_name: str) -> str:
-        """
+        r"""
         Replace invalid filename characters with spaces as Jellyfin does so that
         the playlist and corresponding image are saved in the same directory.
           - Characters: \ / : * ? " < > | and ASCII control chars (0–31)

@@ -15,11 +15,9 @@ umask "$UMASK" || true
 # Create app-data directories
 mkdir -p /data /data/config /data/logs
 
-# Put default cover art in /data if not already there
-if [ ! -d "/data/cover" ]; then
-    echo "Moving default cover art to /data/cover"
-    cp -r /app/cover /data/
-fi
+# Put default cover art in /data. Only files that are not there yet are copied, so covers
+# you changed stay yours and covers added in a new version arrive on an existing install.
+/app/sync_covers.sh /app/cover /data/cover
 
 if [ "$PUID" != "0" ] || [ "$PGID" != "0" ]; then
     
