@@ -20,7 +20,7 @@ import base64
 import shutil
 from vibecodeplugin import (Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient,
                             DeezerClient, is_generated_playlist_name, load_managed_playlists,
-                            categorize_playlist, _write_json_atomic)
+                            categorize_playlist, normalize_name, _write_json_atomic)
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -468,11 +468,34 @@ def index():
                          next_run=describe_next_run(settings),
                          jellyfin_connected=jellyfin_connected)
 
+SECRET_SETTINGS = ('spotify_client_secret', 'discord_webhook_url')
+SECRET_MASK = '********'
+
+
+def mask_secrets(settings):
+    """A copy of the settings that is safe to send to a browser.
+
+    A secret that is set shows as a mask, so it is not written into the page or the JSON
+    for anyone on the network to read. Posting the mask back leaves the stored value as it
+    is; see keep_stored_secrets.
+    """
+    safe = dict(settings)
+    for key in SECRET_SETTINGS:
+        if safe.get(key):
+            safe[key] = SECRET_MASK
+    return safe
+
+
+def keep_stored_secrets(posted):
+    """The posted settings without any secret still showing the mask (the user left it alone)."""
+    return {k: v for k, v in (posted or {}).items() if not (k in SECRET_SETTINGS and v == SECRET_MASK)}
+
+
 @app.route('/settings')
 @requires_auth
 def settings():
     """Settings page - optimized for fast loading"""
-    settings = config_manager.load_settings()
+    settings = mask_secrets(config_manager.load_settings())
     
     # Load page immediately without fetching metadata (will be loaded via AJAX)
     return render_template('settings.html', settings=settings)
@@ -489,13 +512,43 @@ def playlists():
 
 
 
+def playlist_dir_for(name):
+    """The folder of one playlist inside the playlist folder, or None for an unsafe name.
+
+    The name comes from the URL. Without this check a name such as ../../somewhere would
+    point the cover and track list endpoints at any folder the container can read.
+    """
+    if not name or '\x00' in name or '/' in name or '\\' in name or name in ('.', '..'):
+        return None
+    root = Path(config.playlist_folder).resolve()
+    folder = (root / name).resolve()
+    return folder if folder.parent == root else None
+
+
+def folders_made_by_jellyjams(playlist_folder, sanitize=None):
+    """The playlist folders JellyJams made: the ones whose name is in its record.
+
+    Anything else is a hand-made playlist and must not be written to. A folder carries
+    Jellyfin's version of the playlist name, so both spellings of each recorded name count.
+    """
+    names = set()
+    for recorded in load_managed_playlists():
+        names.add(normalize_name(recorded))
+        if sanitize:
+            names.add(sanitize(recorded))
+    return [d for d in sorted(Path(playlist_folder).iterdir())
+            if d.is_dir() and (d.name in names or normalize_name(d.name) in names)]
+
+
 @app.route('/api/users')
 @requires_auth
 def api_users():
     """API endpoint to get Jellyfin users"""
     try:
         jellyfin_api = JellyfinAPI(config, logger)
-        users = jellyfin_api.get_users()
+        # The settings page needs a name and an id; the rest of Jellyfin's user record
+        # (policy, last login, configuration) is not for the browser.
+        users = [{'Id': u.get('Id'), 'Name': u.get('Name')} for u in jellyfin_api.get_users()]
         return jsonify({'success': True, 'users': users})
     except Exception as e:
         logger.error(f"💥 Failed to get Jellyfin users: {e}")
@@ -570,7 +623,7 @@ def api_settings():
         # Return in a shape expected by the frontend JS (with success and settings keys)
         resp = jsonify({
             'success': True,
-            'settings': settings
+            'settings': mask_secrets(settings)
         })
         # Prevent caching so browser always gets latest settings
         resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
@@ -579,7 +632,7 @@ def api_settings():
     
     elif request.method == 'POST':
         try:
-            settings = request.json
+            settings = keep_stored_secrets(request.json)
             # Load previous settings to compute diffs for logging
             previous_settings = config_manager.load_settings()
 
@@ -1010,7 +1063,9 @@ def api_cover_art(playlist_name):
     Supports both 'folder.*' and 'cover.*' with common image extensions.
     """
     try:
-        playlist_dir = Path(config.playlist_folder) / playlist_name
+        playlist_dir = playlist_dir_for(playlist_name)
+        if playlist_dir is None:
+            return '', 404
         logger.debug(f"Cover request for '{playlist_name}', resolved dir: {playlist_dir}")
         if not playlist_dir.exists():
             logger.debug(f"Playlist directory does not exist: {playlist_dir}")
@@ -1130,7 +1185,9 @@ def api_playlist_contents(playlist_name):
     try:
         import xml.etree.ElementTree as ET
         
-        playlist_dir = Path(config.playlist_folder) / playlist_name
+        playlist_dir = playlist_dir_for(playlist_name)
+        if playlist_dir is None:
+            return jsonify({'success': False, 'message': 'Invalid playlist name'})
         playlist_file = playlist_dir / 'playlist.xml'
         
         if not playlist_file.exists():
@@ -1307,7 +1364,9 @@ def api_update_covers():
         if not playlist_folder.exists():
             return jsonify({"error": "Playlist folder not found"}), 404
         
-        playlist_dirs = [d for d in playlist_folder.iterdir() if d.is_dir()]
+        # Only the playlists JellyJams made. Hand-made ones are never written to, even when
+        # their name looks generated ("Techno Radio", "This is ...").
+        playlist_dirs = folders_made_by_jellyjams(playlist_folder, generator._sanitize_playlist_name)
         total_count = len(playlist_dirs)
         
         # Optimized processing with smaller batches and longer timeout
@@ -1397,7 +1456,6 @@ def api_update_covers():
                         # Try folder fallback if both failed
                         if not cover_updated:
                             try:
-                                generator = PlaylistGenerator(config, jellyfin_logger)
                                 if hasattr(generator, '_try_artist_folder_fallback'):
                                     fallback_success = generator._try_artist_folder_fallback(artist_name, playlist_dir)
                                     if fallback_success:
@@ -1494,11 +1552,8 @@ def api_update_covers():
         
         # Send Discord notification for cover art updates
         if updated_count > 0 or error_count > 0:
-            # Collect error messages for Discord notification (limit to 10)
+            # No per-playlist error text is collected; the summary carries the counts
             error_messages = []
-            if hasattr(locals(), 'cover_errors') and cover_errors:
-                error_messages = cover_errors[:10]
-            
             discord_notifier.send_cover_art_summary(updated_count, error_count, error_messages)
         
         return jsonify({
