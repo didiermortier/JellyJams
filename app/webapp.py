@@ -8,7 +8,7 @@ import sys
 import json
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import copy
 from pathlib import Path
 from typing import Dict, List
@@ -20,7 +20,7 @@ import base64
 import shutil
 from vibecodeplugin import (Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient,
                             DeezerClient, is_generated_playlist_name, load_managed_playlists,
-                            categorize_playlist)
+                            categorize_playlist, _write_json_atomic)
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -659,7 +659,7 @@ def api_health():
     """
     status = {}
     try:
-        status_path = Path('/data/run_status.json')
+        status_path = Path(RUN_STATUS_PATH)
         if status_path.exists():
             status = json.loads(status_path.read_text())
     except Exception as e:
@@ -820,10 +820,81 @@ def api_dry_run():
         report = generator.dry_run_report()
         logger.info(f"🔎 Dry run from the web UI: {len(report['plan'])} planned, "
                     f"{len(report['retire'])} to retire, {len(report['unrecorded_generated'])} unrecorded")
+        save_last_preview(report)
         return jsonify({'success': True, 'report': report})
     except Exception as e:
         logger.error(f"Dry run failed: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
+
+
+LAST_PREVIEW_FILE = '/data/last_preview.json'
+RUN_STATUS_PATH = '/data/run_status.json'
+PROGRESS_PATH = '/data/progress.json'
+PROGRESS_STALE_AFTER = 30 * 60     # seconds; a progress file this old belongs to a run that died
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_last_preview(report):
+    """Keep the newest dry run so the dashboard can show it without running another."""
+    try:
+        _write_json_atomic(LAST_PREVIEW_FILE, {
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'report': report,
+        })
+    except Exception as e:
+        logger.warning(f"Could not keep the preview: {e}")
+
+
+def preview_summary(saved, last_run_finished=None):
+    """The stored preview as the counts the dashboard card shows.
+
+    `outdated` is true when a real run finished after the preview was taken: what it
+    predicted has already happened, so it must not be shown as what the next run will do.
+    """
+    if not saved or 'report' not in saved:
+        return None
+    plan = saved['report'].get('plan', [])
+    outdated = bool(last_run_finished and saved.get('when') and last_run_finished > saved['when'])
+    return {
+        'when': saved.get('when'),
+        'outdated': outdated,
+        'create': [p['name'] for p in plan if p.get('action') == 'create'],
+        'replace': sum(1 for p in plan if p.get('action') == 'replace'),
+        'skip': [p['name'] for p in plan if p.get('action') == 'skip'],
+        'retire': [r['name'] for r in saved['report'].get('retire', [])],
+    }
+
+
+@app.route('/api/last_preview')
+def api_last_preview():
+    """The newest stored dry run as counts, or {'preview': null} when there is none."""
+    run = _read_json(RUN_STATUS_PATH) or {}
+    return jsonify({'preview': preview_summary(_read_json(LAST_PREVIEW_FILE), run.get('last_run_finished'))})
+
+
+@app.route('/api/progress')
+def api_progress():
+    """What a running generation is doing. {'running': false} when nothing is, or the run died."""
+    progress = _read_json(PROGRESS_PATH)
+    if not progress or not progress.get('running'):
+        return jsonify({'running': False})
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(progress['updated'])).total_seconds()
+    except (KeyError, ValueError):
+        return jsonify({'running': False})
+    if age > PROGRESS_STALE_AFTER:
+        return jsonify({'running': False})
+    expected = progress.get('expected') or 0
+    written = progress.get('written') or 0
+    percent = min(99, round(100 * written / expected)) if expected else None
+    return jsonify({'running': True, 'stage': progress.get('stage', ''), 'written': written,
+                    'expected': expected, 'percent': percent, 'started': progress.get('started')})
 
 
 @app.route('/api/retire_stale', methods=['POST'])
