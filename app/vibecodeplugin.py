@@ -25,7 +25,7 @@ from io import BytesIO
 # Pillow is a hard requirement: the genre cover fallback draws with it.
 from PIL import Image
 
-from genre_cover import find_cover, render_genre_cover
+from genre_cover import find_cover, render_artist_cover, render_genre_cover
 
 # Configuration
 SETTINGS_FILE = '/data/config/settings.json'
@@ -104,6 +104,8 @@ class Config:
 
         # Deezer cover art (public API, no key or account needed)
         self.deezer_cover_art_enabled = False
+        # Draw "THIS IS / <artist>" on artist covers. Off leaves the plain photo.
+        self.artist_cover_name_overlay = os.getenv('ARTIST_COVER_NAME_OVERLAY', 'true').lower() == 'true'
         
         # User configuration for personalized playlists
         self.personal_playlist_users = 'all'
@@ -183,6 +185,8 @@ class Config:
                     self.spotify_cover_art_enabled = bool(web_settings['spotify_cover_art_enabled'])
                 if 'deezer_cover_art_enabled' in web_settings:
                     self.deezer_cover_art_enabled = bool(web_settings['deezer_cover_art_enabled'])
+                if 'artist_cover_name_overlay' in web_settings:
+                    self.artist_cover_name_overlay = bool(web_settings['artist_cover_name_overlay'])
                 
                 # User configuration for personalized playlists
                 if 'personal_playlist_users' in web_settings:
@@ -961,7 +965,16 @@ class DeezerClient:
                 image = image.resize((1000, 1000), PILImage.Resampling.LANCZOS)
 
             target = playlist_dir / 'cover.jpg'
-            image.save(target, 'JPEG', quality=90)
+            drawn = False
+            if getattr(self.config, 'artist_cover_name_overlay', True):
+                try:
+                    render_artist_cover(image, artist_name, target)
+                    drawn = True
+                except Exception as overlay_err:
+                    self.logger.warning(f"Could not draw the name on {artist_name!r}'s picture, "
+                                        f"using the plain photo: {overlay_err}")
+            if not drawn:
+                image.save(target, 'JPEG', quality=90)
             try:
                 os.chmod(target, 0o664)
             except Exception as chmod_err:
@@ -2322,7 +2335,7 @@ class PlaylistGenerator:
         try:
             with Image.open(BytesIO(source_image)) as source:
                 source.convert('RGB').save(tmp_bg, 'JPEG', quality=90)
-            render_genre_cover(tmp_bg, artist_name, tmp_out)
+            render_artist_cover(tmp_bg, artist_name, tmp_out)
             os.replace(tmp_out, destination)
             self.logger.info(f"✅ Generated artist cover art: {destination}")
             return True
