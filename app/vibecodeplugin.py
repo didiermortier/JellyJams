@@ -1755,7 +1755,7 @@ class PlaylistGenerator:
         for name, playlist_id in sorted(record.items()):
             kind = categorize_playlist(name)
             if (self.RETIRABLE_TYPES.get(kind) not in enabled or kind not in made
-                    or name in self.planned_names):
+                    or normalize_name(name) in self.planned_names):
                 continue
             item = by_id.get(playlist_id)
             if not item or normalize_name(item.get('Name', '')) != normalize_name(name):

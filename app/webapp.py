@@ -804,7 +804,7 @@ def api_dry_run():
     generator refuses every write in that mode, so this is a read-only preview.
     """
     try:
-        dry_config = copy.copy(config)
+        dry_config = copy.deepcopy(config)
         dry_config.dry_run = True
         if request.is_json and request.get_json(silent=True):
             adopt = request.get_json(silent=True).get('adopt_existing_playlists')
@@ -826,7 +826,7 @@ def api_dry_run():
 def api_retire_stale():
     """Remove the generated playlists this run no longer makes (see plan_retirement)."""
     try:
-        retire_config = copy.copy(config)
+        retire_config = copy.deepcopy(config)
         retire_config.retire_stale_playlists = True
         generator = PlaylistGenerator(retire_config, setup_logging(retire_config))
         generator.generate_playlists()

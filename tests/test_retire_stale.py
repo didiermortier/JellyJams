@@ -144,3 +144,34 @@ def test_dry_run_with_adopt_shows_what_the_real_run_would_do(setup):
     assert sorted(e["name"] for e in report["retire"]) == ["Back to the 1970s", "Gangsta Rap Radio", "Samba Radio"]
     actions = {p["name"]: p["action"] for p in gen.dry_run_plan}
     assert actions["Jazz Radio"] == "replace"
+
+
+def test_a_recorded_name_with_curly_punctuation_still_counts_as_planned(setup):
+    """The record can hold a name as Jellyfin spelled it; the run plans it normalized."""
+    gen = setup([pl("a1", "This is Guns N\u2019 Roses!")], {"This is Guns N\u2019 Roses!": "a1"},
+                retire_stale_playlists=True)
+    gen.planned_names = {"This is Guns N' Roses!", "Jazz Radio"}
+
+    assert gen.plan_retirement() == []
+
+
+def test_dry_run_endpoint_does_not_change_the_live_config(webapp_module, monkeypatch):
+    webapp_module.config.excluded_genres = ["x"]
+    seen = {}
+    import vibecodeplugin
+
+    class Spy(vibecodeplugin.PlaylistGenerator):
+        def generate_playlists(self):
+            self.config.excluded_genres.append("leak")
+            seen["dry"] = self.config.dry_run
+            return {}
+
+        def dry_run_report(self):
+            return {"plan": [], "unrecorded_generated": [], "retire": []}
+
+    monkeypatch.setattr(webapp_module, "PlaylistGenerator", Spy)
+    response = webapp_module.app.test_client().post("/api/dry_run", json={})
+
+    assert response.status_code == 200 and seen["dry"] is True
+    assert webapp_module.config.excluded_genres == ["x"]
+    assert webapp_module.config.dry_run is False

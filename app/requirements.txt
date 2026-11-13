@@ -3,5 +3,5 @@ schedule==1.2.0
 python-dotenv==1.0.0
 flask==2.3.3
 Pillow==10.0.1
-# Only needed by the optional Deezer artist-picture lookup (deezer_cover_art_enabled)
-# and by the tests; Pillow is needed at runtime for the genre covers.
+# Optional, not installed: spotipy (Spotify artist pictures; the code logs a warning without it).
+# Pillow is required: the genre and artist covers are drawn with it.
