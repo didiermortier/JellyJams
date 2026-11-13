@@ -258,32 +258,34 @@
         <div class="col-md-6">
             <div class="card mb-4">
                 <div class="card-header">
-                    <h5 class="mb-0"><i class="fab fa-spotify me-2 text-success"></i>Spotify Integration</h5>
+                    <h5 class="mb-0"><i class="fas fa-image me-2"></i>Cover art</h5>
                 </div>
                 <div class="card-body">
-                    <div class="form-check mb-3">
-                        <input class="form-check-input" type="checkbox" id="spotify_cover_art_enabled" name="spotify_cover_art_enabled" {% if settings.spotify_cover_art_enabled %}checked{% endif %}>
-                        <label class="form-check-label" for="spotify_cover_art_enabled">Enable Spotify cover art downloads</label>
-                    </div>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <input type="text" class="form-control mb-2" id="spotify_client_id" name="spotify_client_id" value="{{ settings.spotify_client_id or '' }}" placeholder="Spotify Client ID">
-                        </div>
-                        <div class="col-md-6">
-                            <input type="password" class="form-control" id="spotify_client_secret" name="spotify_client_secret" value="{{ settings.spotify_client_secret or '' }}" placeholder="Spotify Client Secret">
-                        </div>
-                    </div>
-                    <hr>
                     <div class="form-check mb-2">
                         <input class="form-check-input" type="checkbox" id="deezer_cover_art_enabled" name="deezer_cover_art_enabled" {% if settings.deezer_cover_art_enabled %}checked{% endif %}>
-                        <label class="form-check-label" for="deezer_cover_art_enabled">Enable Deezer artist cover art</label>
+                        <label class="form-check-label" for="deezer_cover_art_enabled">Use Deezer artist photos</label>
                     </div>
-                    <div class="form-text">Uses the public Deezer API for square artist photos. No account or API key needed, and it is tried before Spotify.</div>
-                    <div class="form-check mt-3 mb-2">
+                    <div class="form-text mb-3">The public Deezer API gives a square photo for each artist. No account or key needed. Genre and decade covers are shipped with JellyJams and need no setting.</div>
+                    <div class="form-check mb-2">
                         <input class="form-check-input" type="checkbox" id="artist_cover_name_overlay" name="artist_cover_name_overlay" {% if settings.artist_cover_name_overlay is not defined or settings.artist_cover_name_overlay %}checked{% endif %}>
                         <label class="form-check-label" for="artist_cover_name_overlay">Write "This is &lt;artist&gt;" on artist covers</label>
                     </div>
-                    <div class="form-text">Drawn on the artist's photo with a bundled font. Off keeps the plain photo.</div>
+                    <div class="form-text mb-3">Drawn on the photo with a bundled font. Off keeps the plain photo.</div>
+                    <hr>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="spotify_cover_art_enabled" name="spotify_cover_art_enabled" {% if settings.spotify_cover_art_enabled %}checked{% endif %}>
+                        <label class="form-check-label" for="spotify_cover_art_enabled">Also try Spotify (optional)</label>
+                    </div>
+                    <div class="form-text mb-2">Tried after Deezer. Spotify's artist search needs a developer app whose owner has a Premium subscription.</div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <input type="text" class="form-control mb-2" id="spotify_client_id" name="spotify_client_id" value="{{ settings.spotify_client_id or '' }}" placeholder="Spotify Client ID" aria-label="Spotify Client ID">
+                        </div>
+                        <div class="col-md-6">
+                            <input type="password" class="form-control" id="spotify_client_secret" name="spotify_client_secret" value="{{ settings.spotify_client_secret or '' }}" placeholder="Spotify Client Secret" aria-label="Spotify Client Secret" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="form-text">A saved secret shows as ********. Leave it to keep it, or type a new one.</div>
                 </div>
             </div>
         </div>
@@ -629,8 +631,10 @@ function setupEventListeners() {
             success: data => {
                 showAlert(data.message, data.success ? 'success' : 'danger');
             },
-            error: () => {
-                showAlert('An error occurred while saving settings.', 'danger');
+            error: xhr => {
+                // A refused value comes back as 400 with the reason in the body.
+                const reason = xhr.responseJSON && xhr.responseJSON.message;
+                showAlert(reason || 'An error occurred while saving settings.', 'danger');
             },
             complete: () => {
                 button.prop('disabled', false).html(originalText);

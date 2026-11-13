@@ -182,3 +182,89 @@ def test_saving_a_new_or_empty_secret_replaces_it(webapp_module, monkeypatch, tm
 
     client.post("/api/settings", json={"spotify_client_secret": ""})
     assert json.loads(path.read_text())["spotify_client_secret"] == ""
+
+
+# ---- settings are checked before they are saved ----------------------------------------------
+
+@pytest.fixture
+def settings_file(webapp_module, monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"max_tracks_per_playlist": 100, "min_tracks_per_playlist": 5,
+                                "schedule_mode": "weekly"}))
+    monkeypatch.setattr(webapp_module.config_manager, "config_file", str(path))
+    return path
+
+
+@pytest.mark.parametrize("payload", [
+    {"max_tracks_per_playlist": "abc"},
+    {"max_tracks_per_playlist": -5},
+    {"max_tracks_per_playlist": 5000},
+    {"max_tracks_per_playlist": 12.5},
+    {"max_tracks_per_playlist": True},
+    {"generation_interval": 0},
+    {"schedule_time": "25:99"},
+    {"schedule_time": "soon"},
+    {"schedule_mode": "hourly"},
+    {"schedule_weekday": "someday"},
+    {"log_level": "LOUD"},
+    {"playlist_types": "Genre"},
+    {"playlist_types": ["Genre", "Podcast"]},
+    {"jellyfin_url": "not a url"},
+    {"min_tracks_per_playlist": 50, "max_tracks_per_playlist": 10},
+    {"genre_split_share": 2},
+    {"max_genre_playlists": 101},
+])
+def test_a_bad_setting_is_refused_and_nothing_is_saved(webapp_module, settings_file, payload):
+    before = settings_file.read_text()
+
+    response = webapp_module.app.test_client().post("/api/settings", json=payload)
+
+    assert response.status_code == 400, payload
+    body = response.get_json()
+    assert body["success"] is False and body["errors"] and body["message"].startswith("Not saved")
+    assert settings_file.read_text() == before
+
+
+def test_good_settings_are_still_saved(webapp_module, settings_file):
+    payload = {"max_tracks_per_playlist": "80", "min_tracks_per_playlist": 10, "schedule_mode": "daily",
+               "schedule_time": "04:30", "schedule_weekday": "friday", "log_level": "DEBUG",
+               "playlist_types": ["Genre", "Artist"], "jellyfin_url": "http://jellyfin:8096",
+               "generation_interval": 24, "max_genre_playlists": 0, "genre_split_share": 0.25}
+
+    response = webapp_module.app.test_client().post("/api/settings", json=payload)
+
+    assert response.status_code == 200 and response.get_json()["success"] is True
+    assert json.loads(settings_file.read_text())["schedule_mode"] == "daily"
+
+
+def test_a_payload_that_is_not_json_is_refused(webapp_module, settings_file):
+    before = settings_file.read_text()
+
+    response = webapp_module.app.test_client().post("/api/settings", data="nonsense", content_type="text/plain")
+
+    assert response.status_code == 400
+    assert settings_file.read_text() == before
+
+
+def test_the_settings_page_shows_the_reason_a_save_was_refused(webapp_module):
+    page = webapp_module.app.test_client().get("/settings").get_data(as_text=True)
+
+    assert "xhr.responseJSON" in page
+
+
+def test_the_settings_the_live_app_returns_pass_validation(webapp_module):
+    """What the page loaded is what it posts back; that must never be refused."""
+    live = {"artist_cover_name_overlay": True, "auto_generate_on_startup": False, "deezer_cover_art_enabled": True,
+            "discovery_max_songs_per_album": 1, "discovery_max_songs_per_artist": 2, "enabled_artists": [],
+            "excluded_genres": [], "generation_interval": 24, "genre_grouping_enabled": False,
+            "genre_spotlight_slots": 2, "jellyfin_url": "http://10.64.1.2:8096", "listening_window_days": 90,
+            "log_level": "INFO", "max_artist_playlists": 20, "max_genre_playlists": 14, "max_total_playlists": 45,
+            "max_tracks_per_playlist": 100, "min_albums_per_artist": 3, "min_albums_per_decade": 3,
+            "min_artist_diversity": 5, "min_tracks_per_playlist": 5, "personal_playlist_min_user_tracks": 25,
+            "personal_playlist_users": "all", "playlist_types": ["Genre", "Year", "Artist", "Personal"],
+            "schedule_mode": "weekly", "schedule_time": "04:30", "schedule_weekday": "sunday"}
+    # the same values as the form sends them: everything a text field gives is a string
+    as_form = {k: (str(v) if isinstance(v, int) and not isinstance(v, bool) else v) for k, v in live.items()}
+
+    assert webapp_module.validate_settings(live, live) == []
+    assert webapp_module.validate_settings(as_form, live) == []
