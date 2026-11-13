@@ -3,187 +3,97 @@
 {% block title %}Playlists - JellyJams{% endblock %}
 
 {% block content %}
-<div class="row">
-    <div class="col-12">
-        <h1 class="mb-4">
-            <i class="fas fa-list text-primary me-2"></i>Playlist Management
-        </h1>
+<div class="page-head">
+    <div>
+        <h1>Playlists</h1>
+        <p class="page-sub">{{ stats.total - stats.manual }} made by JellyJams, {{ stats.manual }} made by hand. Hand-made playlists are never changed or deleted.</p>
+    </div>
+    <div class="page-actions">
+        <button type="button" class="btn btn-outline-primary" onclick="updateCovers()" id="updateCoversBtn">
+            <i class="fa-solid fa-image"></i>Update covers
+        </button>
+        <button type="button" class="btn btn-outline-danger" onclick="deleteAllPlaylists()">
+            <i class="fa-solid fa-trash-can"></i>Delete generated
+        </button>
     </div>
 </div>
 
-<div class="row mb-4">
-    <div class="col-md-6">
-        <div class="input-group">
-            <span class="input-group-text">
-                <i class="fas fa-search"></i>
-            </span>
-            <input type="text" class="form-control" id="searchInput" placeholder="Search playlists...">
-        </div>
+<div class="toolbar">
+    <div class="input-group search">
+        <span class="input-group-text"><i class="fa-solid fa-magnifying-glass"></i></span>
+        <input type="search" class="form-control" id="searchInput" placeholder="Search playlists" aria-label="Search playlists">
     </div>
-    <div class="col-md-6 text-end">
-        <div class="d-flex gap-2 justify-content-end">
-            <div class="btn-group" role="group">
-                <button type="button" class="btn btn-outline-primary" onclick="filterPlaylists('all')">
-                    <i class="fas fa-list me-1"></i>All ({{ stats.total }})
-                </button>
-                <button type="button" class="btn btn-outline-success" onclick="filterPlaylists('genre')">
-                    <i class="fas fa-music me-1"></i>Genres ({{ stats.genre }})
-                </button>
-                <button type="button" class="btn btn-outline-info" onclick="filterPlaylists('year')">
-                    <i class="fas fa-calendar me-1"></i>Years ({{ stats.year }})
-                </button>
-                <button type="button" class="btn btn-outline-warning" onclick="filterPlaylists('artist')">
-                    <i class="fas fa-user me-1"></i>Artists ({{ stats.artist }})
-                </button>
-                <button type="button" class="btn btn-outline-secondary" onclick="filterPlaylists('personal')">
-                    <i class="fas fa-heart me-1"></i>Personal ({{ stats.personal }})
-                </button>
-                <button type="button" class="btn btn-outline-secondary" onclick="filterPlaylists('manual')">
-                    <i class="fas fa-list me-1"></i>Manual ({{ stats.manual }})
-                </button>
-            </div>
-            <button type="button" class="btn btn-primary" onclick="updateCovers()" id="updateCoversBtn">
-                <i class="fas fa-image me-1"></i>Update Covers
-            </button>
-            <button type="button" class="btn btn-danger" onclick="deleteAllPlaylists()">
-                <i class="fas fa-trash-alt me-1"></i>Delete Generated
-            </button>
-        </div>
+    <div class="seg" id="filters" role="group" aria-label="Filter playlists">
+        <button type="button" data-filter="generated" onclick="filterPlaylists('generated')">Made by JellyJams<span class="count">({{ stats.total - stats.manual }})</span></button>
+        <button type="button" data-filter="all" onclick="filterPlaylists('all')">All<span class="count">({{ stats.total }})</span></button>
+        <button type="button" data-filter="genre" onclick="filterPlaylists('genre')">Genres<span class="count">({{ stats.genre }})</span></button>
+        <button type="button" data-filter="year" onclick="filterPlaylists('year')">Years<span class="count">({{ stats.year }})</span></button>
+        <button type="button" data-filter="artist" onclick="filterPlaylists('artist')">Artists<span class="count">({{ stats.artist }})</span></button>
+        <button type="button" data-filter="personal" onclick="filterPlaylists('personal')">Personal<span class="count">({{ stats.personal }})</span></button>
+        <button type="button" data-filter="manual" onclick="filterPlaylists('manual')">Manual<span class="count">({{ stats.manual }})</span></button>
     </div>
 </div>
 
-<div class="playlists-grid" id="playlistsContainer">
-    {% for playlist in playlists %}
-        <div class="playlist-item" 
+<div id="playlistsContainer">
+    {% for category, label, members in groups %}
+    <section class="pl-group" data-group="{{ category }}" aria-labelledby="group-{{ category }}">
+        <div class="pl-group-head">
+            <h2 id="group-{{ category }}">{{ label }}</h2>
+            <span class="pl-group-count">{{ members|length }}</span>
+        </div>
+        <div class="playlists-grid">
+        {% for playlist in members %}
+        <div class="pl-item playlist-item"
              data-name="{{ playlist.name.lower() }}"
              data-type="{{ playlist.category }}">
-            <div class="card h-100">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                    <h6 class="mb-0">
-                        {% if playlist.category == 'genre' %}
-                            <i class="fas fa-music text-success me-1"></i>
-                        {% elif playlist.category == 'year' %}
-                            <i class="fas fa-calendar text-info me-1"></i>
-                        {% elif playlist.category == 'artist' %}
-                            <i class="fas fa-user text-warning me-1"></i>
-                        {% elif playlist.category == 'personal' %}
-                            <i class="fas fa-heart text-secondary me-1"></i>
-                        {% else %}
-                            <i class="fas fa-list text-secondary me-1"></i>
-                        {% endif %}
-                        {{ playlist.name }}
-                    </h6>
-                    <div class="dropdown">
-                        <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" 
-                                data-bs-toggle="dropdown">
-                            <i class="fas fa-ellipsis-v"></i>
-                        </button>
-                        <ul class="dropdown-menu">
-                            <li>
-                                <a class="dropdown-item view-playlist-btn" href="#" data-playlist-name="{{ playlist.name }}">
-                                    <i class="fas fa-eye me-1"></i>View Details
-                                </a>
-                            </li>
-                            <li>
-                                <a class="dropdown-item text-danger delete-playlist-btn" href="#" data-playlist-name="{{ playlist.name }}">
-                                    <i class="fas fa-trash me-1"></i>Delete
-                                </a>
-                            </li>
-                        </ul>
+            <div class="pl-card">
+                <div class="pl-cover">
+                    <img src="{{ url_for('api_cover_art', playlist_name=playlist.name) }}"
+                         alt="Cover of {{ playlist.name }}"
+                         loading="lazy"
+                         onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                    <div class="ph" aria-hidden="true">
+                        {% if playlist.category == 'artist' %}<i class="fa-solid fa-user"></i>
+                        {% elif playlist.category == 'genre' %}<i class="fa-solid fa-music"></i>
+                        {% elif playlist.category == 'year' %}<i class="fa-solid fa-calendar"></i>
+                        {% else %}<i class="fa-solid fa-list"></i>{% endif %}
                     </div>
                 </div>
-                <!-- Cover Art Section -->
-                <div class="playlist-cover-container" style="position: relative; aspect-ratio: 1 / 1; overflow: hidden;">
-                    <img src="{{ url_for('api_cover_art', playlist_name=playlist.name) }}" 
-                         alt="{{ playlist.name }} cover" 
-                         class="playlist-cover-image" 
-                         style="width: 100%; height: 100%; object-fit: cover; background-color: #f8f9fa; display: block;"
-                         onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
-                         loading="lazy">
-                    <div class="playlist-cover-placeholder" 
-                         style="display: none; width: 100%; height: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); align-items: center; justify-content: center; color: white; font-size: 3rem;">
-                        {% if 'This is' in playlist.name %}
-                            <i class="fas fa-user"></i>
-                        {% elif 'Radio' in playlist.name %}
-                            <i class="fas fa-music"></i>
-                        {% elif 'Back to' in playlist.name %}
-                            <i class="fas fa-calendar"></i>
-                        {% else %}
-                            <i class="fas fa-list"></i>
-                        {% endif %}
-                    </div>
+                <div class="pl-menu dropdown">
+                    <button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Actions for {{ playlist.name }}">
+                        <i class="fa-solid fa-ellipsis-vertical"></i>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end">
+                        <li><a class="dropdown-item view-playlist-btn" href="#" data-playlist-name="{{ playlist.name }}"><i class="fa-solid fa-eye me-2"></i>View tracks</a></li>
+                        <li><a class="dropdown-item text-danger delete-playlist-btn" href="#" data-playlist-name="{{ playlist.name }}"><i class="fa-solid fa-trash me-2"></i>Delete</a></li>
+                    </ul>
                 </div>
-                <div class="card-body">
-                    <div class="row text-center">
-                        <div class="col-6">
-                            <h5 class="text-primary mb-0">{{ playlist.track_count }}</h5>
-                            <small class="text-muted">Tracks</small>
-                        </div>
-                        <div class="col-6">
-                            <h5 class="text-secondary mb-0">{{ "%.1f"|format(playlist.size / 1024) }} KB</h5>
-                            <small class="text-muted">Size</small>
-                        </div>
+                <div class="pl-body">
+                    <h2 class="pl-name" title="{{ playlist.name }}">{{ playlist.name }}</h2>
+                    <div class="pl-meta">
+                        <span class="chip {{ playlist.category }}">{{ {'genre': 'Genre', 'year': 'Year', 'artist': 'Artist', 'personal': 'Personal', 'manual': 'Manual'}[playlist.category] }}</span>
+                        <span>{{ playlist.track_count }} tracks</span>
                     </div>
-                    <hr>
-                    <div class="small text-muted">
-                        <div class="d-flex justify-content-between">
-                            <span><i class="fas fa-plus me-1"></i>Created:</span>
-                            <span>{{ playlist.created }}</span>
-                        </div>
-                        <div class="d-flex justify-content-between">
-                            <span><i class="fas fa-edit me-1"></i>Modified:</span>
-                            <span>{{ playlist.modified }}</span>
-                        </div>
-                        {% if playlist.delta_added is not none and playlist.delta_removed is not none %}
-                        <div class="d-flex justify-content-between">
-                            <span><i class="fas fa-exchange-alt me-1"></i>Changes:</span>
-                            <span>
-                                <span class="{% if playlist.delta_removed and playlist.delta_removed > 0 %}text-danger{% else %}text-muted{% endif %}">-{{ playlist.delta_removed or 0 }}</span>
-                                <span class="ms-2 {% if playlist.delta_added and playlist.delta_added > 0 %}text-success{% else %}text-muted{% endif %}">+{{ playlist.delta_added or 0 }}</span>
-                            </span>
-                        </div>
+                    <div class="pl-meta mt-1">
+                        <span title="Last written {{ playlist.modified }}">Updated {{ playlist.modified[:10] }}</span>
+                        {% if playlist.delta_added or playlist.delta_removed %}
+                        <span class="pl-delta" title="Change since the last time this page looked">
+                            <span class="add">+{{ playlist.delta_added or 0 }}</span> <span class="del">-{{ playlist.delta_removed or 0 }}</span>
+                        </span>
                         {% endif %}
                     </div>
                 </div>
             </div>
         </div>
+        {% endfor %}
+        </div>
+    </section>
     {% endfor %}
-    
-    {% if not playlists %}
-        <div class="col-12">
-            <div class="card">
-                <div class="card-body text-center py-5">
-                    <i class="fas fa-music fa-3x text-muted mb-3"></i>
-                    <h4 class="text-muted">No Playlists Found</h4>
-                    <p class="text-muted">Generate some playlists to get started!</p>
-                    <a href="{{ url_for('index') }}" class="btn btn-primary">
-                        <i class="fas fa-arrow-left me-1"></i>Back to Dashboard
-                    </a>
-                </div>
-            </div>
-        </div>
-    {% endif %}
-</div>
-
-<!-- Playlist Details Modal -->
-<div class="modal fade" id="playlistModal" tabindex="-1">
-    <div class="modal-dialog modal-lg">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" id="playlistModalTitle">Playlist Details</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body" id="playlistModalBody">
-                <div class="text-center">
-                    <div class="spinner-border" role="status">
-                        <span class="visually-hidden">Loading...</span>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-            </div>
-        </div>
+    <div class="empty-state" id="emptyState" {% if playlists %}hidden{% endif %}>
+        <i class="fa-solid fa-music"></i>
+        <h2 class="h5" id="emptyTitle">{{ 'No playlists found' if not playlists else 'Nothing matches' }}</h2>
+        <p class="mb-3" id="emptyText">{{ 'Generate some playlists to get started.' if not playlists else 'Try another word or filter.' }}</p>
+        {% if not playlists %}<a href="{{ url_for('index') }}" class="btn btn-primary">Back to the dashboard</a>{% endif %}
     </div>
 </div>
 
@@ -193,7 +103,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title">Delete Playlist</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <p>Are you sure you want to delete the playlist <strong id="deletePlaylistName"></strong>?</p>
@@ -217,7 +127,7 @@
                 <h5 class="modal-title text-danger">
                     <i class="fas fa-exclamation-triangle me-2"></i>Delete Generated Playlists
                 </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <div class="alert alert-danger">
@@ -245,11 +155,11 @@
 
 <!-- Playlist View Modal -->
 <div class="modal fade" id="playlistModal" tabindex="-1">
-    <div class="modal-dialog modal-lg">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="playlistModalTitle">Playlist Details</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body" id="playlistModalBody">
                 <!-- Playlist contents will be loaded here -->
@@ -264,54 +174,56 @@
 
 {% block scripts %}
 <script>
-let currentFilter = 'all';
+let currentFilter = 'generated';
+const FILTERS = ['generated', 'all', 'genre', 'year', 'artist', 'personal', 'manual'];
 
 $(document).ready(function() {
-    // Search functionality
-    $('#searchInput').on('input', function() {
-        filterPlaylists(currentFilter);
-    });
-    
-    // Set initial filter button state
-    $('button[onclick="filterPlaylists(\'all\')"]').addClass('active');
-    
-    // Event delegation for playlist view buttons
+    $('#searchInput').on('input', function() { filterPlaylists(currentFilter); });
+
+    // The dashboard tiles link here with #genre, #manual and so on.
+    const fromHash = (location.hash || '').replace('#', '');
+    filterPlaylists(FILTERS.includes(fromHash) ? fromHash : 'generated');
+
     $(document).on('click', '.view-playlist-btn', function(e) {
         e.preventDefault();
-        const playlistName = $(this).data('playlist-name');
-        viewPlaylist(playlistName);
+        viewPlaylist($(this).data('playlist-name'));
     });
-    
-    // Event delegation for playlist delete buttons
     $(document).on('click', '.delete-playlist-btn', function(e) {
         e.preventDefault();
-        const playlistName = $(this).data('playlist-name');
-        deletePlaylist(playlistName);
+        deletePlaylist($(this).data('playlist-name'));
     });
 });
 
 function filterPlaylists(type) {
     currentFilter = type;
     const searchTerm = $('#searchInput').val().toLowerCase();
-    
-    // Update button states
-    $('.btn-group button').removeClass('active');
-    $(`button[onclick="filterPlaylists('${type}')"]`).addClass('active');
-    
+
+    $('#filters button').removeClass('active').attr('aria-pressed', 'false');
+    $('#filters button[data-filter="' + type + '"]').addClass('active').attr('aria-pressed', 'true');
+
+    let shown = 0;
     $('.playlist-item').each(function() {
         const $item = $(this);
-        const name = $item.data('name');
         const itemType = $item.data('type');
-        
-        const matchesSearch = name.includes(searchTerm);
-        const matchesType = type === 'all' || itemType === type;
-        
-        if (matchesSearch && matchesType) {
-            $item.show();
-        } else {
-            $item.hide();
-        }
+        const inFilter = type === 'all' || (type === 'generated' ? itemType !== 'manual' : itemType === type);
+        const matches = String($item.data('name')).includes(searchTerm) && inFilter;
+        $item.toggle(matches);
+        $item.attr('data-match', matches ? '1' : '0');
+        if (matches) shown++;
     });
+
+    // A heading with nothing under it is hidden.
+    $('.pl-group').each(function() {
+        // Count matches, not :visible, because a hidden group hides its own items.
+        $(this).toggle($(this).find('.playlist-item[data-match="1"]').length > 0);
+    });
+
+    const hasAny = $('.playlist-item').length > 0;
+    $('#emptyState').prop('hidden', shown > 0);
+    if (hasAny && shown === 0) {
+        $('#emptyTitle').text('Nothing matches');
+        $('#emptyText').text('Try another word or filter.');
+    }
 }
 
 // Helper function to format duration from milliseconds
@@ -323,13 +235,6 @@ function formatDuration(durationMs) {
     const seconds = totalSeconds % 60;
     
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-}
-
-// Helper function to escape HTML
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 function viewPlaylist(playlistName) {
@@ -359,7 +264,7 @@ function viewPlaylist(playlistName) {
                         </div>
                         <div class="table-responsive">
                             <table class="table table-sm table-hover">
-                                <thead class="table-light">
+                                <thead>
                                     <tr>
                                         <th>#</th>
                                         <th>Title</th>
@@ -403,7 +308,7 @@ function viewPlaylist(playlistName) {
                 $('#playlistModalBody').html(`
                     <div class="alert alert-danger">
                         <i class="fas fa-exclamation-circle me-2"></i>
-                        Error loading playlist: ${data.message}
+                        Error loading playlist: ${escapeHtml(data.message)}
                     </div>
                 `);
             }
@@ -444,25 +349,9 @@ function deletePlaylist(playlistName) {
                     // Remove the playlist card from the page
                     $(`.playlist-item[data-name="${playlistName.toLowerCase()}"]`).fadeOut(300, function() {
                         $(this).remove();
-                        
-                        // Check if no playlists remain
-                        if ($('.playlist-item').length === 0) {
-                            $('#playlistsContainer').html(`
-                                <div class="col-12">
-                                    <div class="card">
-                                        <div class="card-body text-center py-5">
-                                            <i class="fas fa-music fa-3x text-muted mb-3"></i>
-                                            <h4 class="text-muted">No Playlists Found</h4>
-                                            <p class="text-muted">Generate some playlists to get started!</p>
-                                            <a href="{{ url_for('index') }}" class="btn btn-primary">
-                                                <i class="fas fa-arrow-left me-1"></i>Back to Dashboard
-                                            </a>
-                                        </div>
-                                    </div>
-                                </div>
-                            `);
-                        }
+                        filterPlaylists(currentFilter);
                     });
+                    setTimeout(function() { location.reload(); }, 1200);
                 } else {
                     showAlert('Failed to delete playlist: ' + data.message, 'danger');
                 }
@@ -504,27 +393,8 @@ function deleteAllPlaylists() {
                 
                 if (data.success) {
                     showAlert(`Successfully deleted ${data.deleted_count} playlist(s)!`, 'success');
-                    // Remove all playlist cards and show empty state
-                    $('#playlistsContainer').html(`
-                        <div class="col-12">
-                            <div class="card">
-                                <div class="card-body text-center py-5">
-                                    <i class="fas fa-music fa-3x text-muted mb-3"></i>
-                                    <h4 class="text-muted">No Playlists Found</h4>
-                                    <p class="text-muted">Generate some playlists to get started!</p>
-                                    <a href="{{ url_for('index') }}" class="btn btn-primary">
-                                        <i class="fas fa-arrow-left me-1"></i>Back to Dashboard
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-                    `);
-                    
-                    // Hide the delete all button since no playlists remain
-                    $('button[onclick="deleteAllPlaylists()"]').hide();
-                    
-                    // Update the filter button count
-                    $('button[onclick="filterPlaylists(\'all\')"').html('<i class="fas fa-list me-1"></i>All (0)');
+                    // The grid and the counts come from the server, so load them again.
+                    setTimeout(function() { location.reload(); }, 1200);
                 } else {
                     showAlert('Failed to delete playlists: ' + data.message, 'danger');
                 }

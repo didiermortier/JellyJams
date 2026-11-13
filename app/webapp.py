@@ -8,7 +8,7 @@ import sys
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import copy
 from pathlib import Path
 from typing import Dict, List
@@ -464,6 +464,8 @@ def index():
     return render_template('index.html', 
                          settings=settings,
                          playlist_stats=playlist_stats,
+                         playlist_folder=config.playlist_folder,
+                         next_run=describe_next_run(settings),
                          jellyfin_connected=jellyfin_connected)
 
 @app.route('/settings')
@@ -482,6 +484,7 @@ def playlists():
     playlist_data = get_detailed_playlist_info()
     return render_template('playlists.html', 
                          playlists=playlist_data['playlists'], 
+                         groups=group_playlists(playlist_data['playlists']),
                          stats=playlist_data['stats'])
 
 
@@ -1517,6 +1520,67 @@ def get_playlist_stats():
         logger.error(f"Error getting playlist stats: {e}")
         return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
 
+_WEEKDAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+
+
+def next_run_time(settings, now=None):
+    """When the scheduler next generates playlists, as a datetime, or None.
+
+    None for manual mode and for interval mode, where the next run depends on when the
+    scheduler last started, which the web UI does not know. Same rules as the scheduler in
+    vibecodeplugin.main: daily at HH:MM, or weekly on a weekday at HH:MM.
+    """
+    now = now or datetime.now()
+    mode = settings.get('schedule_mode')
+    if mode not in ('daily', 'weekly'):
+        return None
+    try:
+        hour, minute = (int(part) for part in str(settings.get('schedule_time', '04:30')).split(':')[:2])
+        at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except (ValueError, TypeError):
+        return None
+    if mode == 'daily':
+        return at if at > now else at + timedelta(days=1)
+    weekday = str(settings.get('schedule_weekday', 'sunday')).lower()
+    if weekday not in _WEEKDAYS:
+        weekday = 'sunday'
+    ahead = (_WEEKDAYS.index(weekday) - now.weekday()) % 7
+    when = at + timedelta(days=ahead)
+    return when if when > now else when + timedelta(days=7)
+
+
+def describe_next_run(settings, now=None):
+    """'Sunday 15 Nov at 04:30, in 2 days' for the dashboard, or '' when there is no fixed time."""
+    now = now or datetime.now()
+    when = next_run_time(settings, now)
+    if when is None:
+        return ''
+    seconds = int((when - now).total_seconds())
+    if seconds < 3600:
+        away = 'in under an hour'
+    elif seconds < 86400:
+        away = f"in {seconds // 3600} hours"
+    else:
+        days = seconds // 86400
+        away = f"in {days} day{'s' if days != 1 else ''}"
+    return f"{when.strftime('%A')} {when.day} {when.strftime('%b')} at {when.strftime('%H:%M')}, {away}"
+
+
+PLAYLIST_CATEGORY_ORDER = {'genre': 0, 'year': 1, 'artist': 2, 'personal': 3, 'manual': 4}
+PLAYLIST_GROUP_LABELS = {'genre': 'Genres', 'year': 'Decades', 'artist': 'Artists',
+                         'personal': 'Personal mixes', 'manual': 'Hand-made'}
+
+
+def group_playlists(playlists):
+    """Playlists as [(category, label, [playlist, ...])] in display order, empty groups left out."""
+    groups = []
+    for category in sorted(PLAYLIST_CATEGORY_ORDER, key=PLAYLIST_CATEGORY_ORDER.get):
+        members = [p for p in playlists if p['category'] == category]
+        if members:
+            groups.append((category, PLAYLIST_GROUP_LABELS[category], members))
+    return groups
+
+
 def get_detailed_playlist_info():
     """Get detailed playlist information with proper categorization"""
     try:
@@ -1671,7 +1735,8 @@ def get_detailed_playlist_info():
                     })
         
         return {
-            'playlists': sorted(playlists, key=lambda x: x['name']),
+            # What JellyJams made comes first, hand-made playlists after, each group by name.
+            'playlists': sorted(playlists, key=lambda x: (PLAYLIST_CATEGORY_ORDER.get(x['category'], 9), x['name'].lower())),
             'stats': stats
         }
     except Exception as e:

@@ -3,71 +3,37 @@
 {% block title %}Logs - JellyJams{% endblock %}
 
 {% block content %}
-<div class="row">
-    <div class="col-12">
-        <h1 class="mb-4">
-            <i class="fas fa-file-alt text-primary me-2"></i>Application Logs
-        </h1>
+<div class="page-head">
+    <div>
+        <h1>Logs</h1>
+        <p class="page-sub">What JellyJams did, newest at the bottom.</p>
+    </div>
+    <div class="page-actions">
+        <button type="button" class="btn btn-outline-secondary" id="refreshBtn" onclick="refreshLogs()"><i class="fa-solid fa-rotate"></i>Refresh</button>
+        <button type="button" class="btn btn-outline-secondary" onclick="downloadLogs()"><i class="fa-solid fa-download"></i>Download</button>
     </div>
 </div>
 
-<div class="row mb-3">
-    <div class="col-md-6">
-        <div class="btn-group" role="group">
-            <button type="button" class="btn btn-outline-primary active" onclick="filterLogs('all')">
-                <i class="fas fa-list me-1"></i>All
-            </button>
-            <button type="button" class="btn btn-outline-success" onclick="filterLogs('info')">
-                <i class="fas fa-info-circle me-1"></i>Info
-            </button>
-            <button type="button" class="btn btn-outline-secondary" onclick="filterLogs('debug')">
-                <i class="fas fa-bug me-1"></i>Debug
-            </button>
-            <button type="button" class="btn btn-outline-warning" onclick="filterLogs('warning')">
-                <i class="fas fa-exclamation-triangle me-1"></i>Warning
-            </button>
-            <button type="button" class="btn btn-outline-danger" onclick="filterLogs('error')">
-                <i class="fas fa-times-circle me-1"></i>Error
-            </button>
-        </div>
+<div class="toolbar">
+    <div class="seg" id="levels" role="group" aria-label="Filter by level">
+        <button type="button" data-level="all" class="active" onclick="filterLogs('all')">All</button>
+        <button type="button" data-level="info" onclick="filterLogs('info')">Info</button>
+        <button type="button" data-level="debug" onclick="filterLogs('debug')">Debug</button>
+        <button type="button" data-level="warning" onclick="filterLogs('warning')">Warnings</button>
+        <button type="button" data-level="error" onclick="filterLogs('error')">Errors</button>
     </div>
-    <div class="col-md-6 text-end">
-        <div class="btn-group" role="group">
-            <button type="button" class="btn btn-outline-secondary" onclick="refreshLogs()">
-                <i class="fas fa-sync me-1"></i>Refresh
-            </button>
-            <button type="button" class="btn btn-outline-secondary" onclick="clearLogs()">
-                <i class="fas fa-trash me-1"></i>Clear
-            </button>
-            <button type="button" class="btn btn-outline-secondary" onclick="downloadLogs()">
-                <i class="fas fa-download me-1"></i>Download
-            </button>
-        </div>
+    <div class="form-check form-switch ms-auto mb-0">
+        <input class="form-check-input" type="checkbox" id="autoRefresh" checked>
+        <label class="form-check-label" for="autoRefresh">Auto-refresh</label>
     </div>
 </div>
 
 <div class="row">
     <div class="col-12">
         <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">
-                    <i class="fas fa-terminal me-2"></i>Log Output
-                </h5>
-                <div class="form-check form-switch">
-                    <input class="form-check-input" type="checkbox" id="autoRefresh" checked>
-                    <label class="form-check-label" for="autoRefresh">
-                        Auto-refresh
-                    </label>
-                </div>
-            </div>
             <div class="card-body p-0">
                 <!-- Responsive log container: fills available viewport height and scrolls -->
-                <div class="log-container p-3" id="logContainer" style="
-                        height: auto;
-                        max-height: calc(100vh - 260px);
-                        overflow: auto;
-                        background: rgba(0,0,0,0.25);
-                    ">
+                <div class="log-box p-3" id="logContainer">
                     {% if log_content %}
                         <pre id="logContent" style="
                                 margin: 0;
@@ -86,38 +52,10 @@
                     {% endif %}
                 </div>
             </div>
-            <div class="card-footer">
-                <small class="text-muted">
-                    <i class="fas fa-info-circle me-1"></i>
-                    Logs are automatically refreshed every second when auto-refresh is enabled.
-                    Use the filter buttons above to show specific log levels.
-                </small>
-            </div>
         </div>
     </div>
 </div>
 
-<!-- Clear Logs Confirmation Modal -->
-<div class="modal fade" id="clearLogsModal" tabindex="-1">
-    <div class="modal-dialog">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title">Clear Logs</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body">
-                <p>Are you sure you want to clear all application logs?</p>
-                <p class="text-muted">This action cannot be undone.</p>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-danger" id="confirmClearBtn">
-                    <i class="fas fa-trash me-1"></i>Clear Logs
-                </button>
-            </div>
-        </div>
-    </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
@@ -155,92 +93,58 @@ function stopAutoRefresh() {
 }
 
 function refreshLogs() {
-    const button = $('button:contains("Refresh")');
+    const button = $('#refreshBtn');
     const originalText = button.html();
     const isAuto = $('#autoRefresh').is(':checked');
     if (!isAuto) { showSpinner(button); }
 
-    $.getJSON('/api/logs_tail?lines=100')
+    $.getJSON('/api/logs_tail?lines=300')
         .done(function(resp) {
             const content = resp && resp.lines ? resp.lines : '';
-            $('#logContent').text(content);
+            if (!content) { return; }
+            if (!$('#logContent').length) {
+                $('#logContainer').html('<pre id="logContent" class="mb-0" style="white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.4;"></pre>');
+            }
+            rawLog = content;
             filterLogs(currentFilter);
-            scrollToBottom();
         })
         .fail(function() {
-            if (!isAuto) { showAlert('Error refreshing logs.', 'danger'); }
+            if (!isAuto) { showAlert('Could not load the logs.', 'danger'); }
         })
         .always(function() {
             if (!isAuto) { hideSpinner(button, originalText); }
         });
 }
 
+// The full text is kept apart from what is shown, so changing the filter never loses lines.
+let rawLog = null;
+
+function levelMatches(line, level) {
+    const upper = line.toUpperCase();
+    switch (level) {
+        case 'info': return upper.includes(' INFO ');
+        case 'debug': return upper.includes(' DEBUG ');
+        case 'warning': return upper.includes(' WARNING ') || upper.includes(' WARN ');
+        case 'error': return upper.includes(' ERROR ');
+        default: return true;
+    }
+}
+
 function filterLogs(level) {
     currentFilter = level;
-    
-    // Update button states
-    $('.btn-group button').removeClass('active');
-    $(`button[onclick="filterLogs('${level}')"]`).addClass('active');
-    
+    $('#levels button').removeClass('active').attr('aria-pressed', 'false');
+    $('#levels button[data-level="' + level + '"]').addClass('active').attr('aria-pressed', 'true');
+
     const logContent = $('#logContent');
-    const lines = logContent.text().split('\n');
-    
-    if (level === 'all') {
-        // Show all lines
-        logContent.text(lines.join('\n'));
-    } else {
-        // Filter lines by log level
-        const filteredLines = lines.filter(line => {
-            const upperLine = line.toUpperCase();
-            switch (level) {
-                case 'info':
-                    return upperLine.includes(' INFO ');
-                case 'debug':
-                    return upperLine.includes(' DEBUG ');
-                case 'warning':
-                    return upperLine.includes(' WARNING ') || upperLine.includes(' WARN ');
-                case 'error':
-                    return upperLine.includes(' ERROR ');
-                default:
-                    return true;
-            }
-        });
-        logContent.text(filteredLines.join('\n'));
-    }
-    
+    if (!logContent.length) return;
+    if (rawLog === null) rawLog = logContent.text();
+    const lines = rawLog.split('\n').filter(function(line) { return levelMatches(line, level); });
+    logContent.text(lines.join('\n'));
     scrollToBottom();
 }
 
-function clearLogs() {
-    const modal = new bootstrap.Modal(document.getElementById('clearLogsModal'));
-    modal.show();
-    
-    $('#confirmClearBtn').off('click').on('click', function() {
-        const button = $(this);
-        const originalText = button.html();
-        showSpinner(button);
-        
-        // This would need to be implemented in the backend
-        // For now, just clear the display
-        setTimeout(() => {
-            $('#logContent').text('');
-            $('#logContainer').html(`
-                <div class="text-center text-muted py-5">
-                    <i class="fas fa-file-alt fa-3x mb-3"></i>
-                    <h5>Logs cleared</h5>
-                    <p>New logs will appear here as they are generated.</p>
-                </div>
-            `);
-            
-            hideSpinner(button, originalText);
-            modal.hide();
-            showAlert('Logs cleared successfully!', 'success');
-        }, 1000);
-    });
-}
-
 function downloadLogs() {
-    const logContent = $('#logContent').text();
+    const logContent = rawLog !== null ? rawLog : $('#logContent').text();
     
     if (!logContent.trim()) {
         showAlert('No logs available to download.', 'warning');
@@ -257,7 +161,7 @@ function downloadLogs() {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
     
-    showAlert('Logs downloaded successfully!', 'success');
+    showAlert('Logs downloaded.', 'success');
 }
 
 function scrollToBottom() {
