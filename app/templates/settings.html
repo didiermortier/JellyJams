@@ -58,7 +58,27 @@
                             <input class="form-check-input" type="checkbox" id="genre_grouping_enabled" name="genre_grouping_enabled" {% if settings.genre_grouping_enabled %}checked{% endif %}>
                             <label class="form-check-label" for="genre_grouping_enabled">Group similar genres into one playlist</label>
                         </div>
-                        <div class="form-text">On: House, Techno, Trance and Tech House all become "Electronic Radio". Off: every genre gets its own playlist.</div>
+                        <div class="form-text">On: related genres share a playlist (Classic Rock, Hard Rock and Grunge become "Rock Radio"), except when a group is so big it would swallow the library, as Electronic does in a house collection. Then each genre keeps its own playlist. Off: every genre gets its own playlist.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="max_genre_playlists" class="form-label">Genre Playlists</label>
+                        <input type="number" class="form-control" id="max_genre_playlists" name="max_genre_playlists" value="{{ settings.max_genre_playlists if settings.max_genre_playlists is not none else 14 }}" min="0" max="100" required>
+                        <div class="form-text">The biggest genres in your library always get a playlist, up to this number</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="genre_spotlight_slots" class="form-label">Rotating Spotlight Genres</label>
+                        <input type="number" class="form-control" id="genre_spotlight_slots" name="genre_spotlight_slots" value="{{ settings.genre_spotlight_slots if settings.genre_spotlight_slots is not none else 2 }}" min="0" max="20" required>
+                        <div class="form-text">Extra genres picked from the smaller ones. They change every week, so the rest of your library gets a turn</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="max_artist_playlists" class="form-label">Artist Playlists</label>
+                        <input type="number" class="form-control" id="max_artist_playlists" name="max_artist_playlists" value="{{ settings.max_artist_playlists if settings.max_artist_playlists is not none else 20 }}" min="0" max="200" required>
+                        <div class="form-text">"This is ...!" playlists for the artists with the most tracks, up to this number</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="max_total_playlists" class="form-label">Maximum Playlists in Total</label>
+                        <input type="number" class="form-control" id="max_total_playlists" name="max_total_playlists" value="{{ settings.max_total_playlists if settings.max_total_playlists is not none else 45 }}" min="0" max="500" required>
+                        <div class="form-text">Genre, decade and artist playlists together never exceed this. Personal mixes are not counted</div>
                     </div>
                 </div>
             </div>
@@ -321,6 +341,10 @@ function populateAllSettings() {
     $('#min_tracks_per_playlist').val(currentSettings.min_tracks_per_playlist || 5);
     $('#min_artist_diversity').val(currentSettings.min_artist_diversity || 5);
     $('#min_albums_per_artist').val(currentSettings.min_albums_per_artist || 2);
+    $('#max_genre_playlists').val(currentSettings.max_genre_playlists ?? 14);
+    $('#genre_spotlight_slots').val(currentSettings.genre_spotlight_slots ?? 2);
+    $('#max_artist_playlists').val(currentSettings.max_artist_playlists ?? 20);
+    $('#max_total_playlists').val(currentSettings.max_total_playlists ?? 45);
 
     // Playlist types
     const types = Array.isArray(currentSettings.playlist_types)

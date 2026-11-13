@@ -23,10 +23,19 @@ def _mkdir_outside_data(self, *args, **kwargs):
 
 
 @pytest.fixture(scope="session")
-def webapp_module():
+def _webapp_import():
     with mock.patch.object(Path, "mkdir", _mkdir_outside_data):
         import webapp
     return webapp
+
+
+@pytest.fixture
+def webapp_module(_webapp_import):
+    """The web app, with its global config put back after each test."""
+    saved = dict(_webapp_import.config.__dict__)
+    yield _webapp_import
+    _webapp_import.config.__dict__.clear()
+    _webapp_import.config.__dict__.update(saved)
 
 
 @pytest.fixture

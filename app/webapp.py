@@ -98,6 +98,10 @@ class ConfigManager:
             'min_albums_per_decade': getattr(config, 'min_albums_per_decade', 3),
             'trigger_library_scan': getattr(config, 'trigger_library_scan', True),
             'genre_grouping_enabled': getattr(config, 'genre_grouping_enabled', True),
+            'max_genre_playlists': getattr(config, 'max_genre_playlists', 14),
+            'genre_spotlight_slots': getattr(config, 'genre_spotlight_slots', 2),
+            'max_artist_playlists': getattr(config, 'max_artist_playlists', 20),
+            'max_total_playlists': getattr(config, 'max_total_playlists', 45),
             # Scheduling settings
             'auto_generate_on_startup': getattr(config, 'auto_generate_on_startup', False),
             'schedule_mode': getattr(config, 'schedule_mode', 'weekly'),
@@ -198,6 +202,12 @@ class ConfigManager:
             config.listening_window_days = int(settings.get('listening_window_days', getattr(config, 'listening_window_days', 90)))
         except (TypeError, ValueError):
             pass
+        
+        for key in ('max_genre_playlists', 'genre_spotlight_slots', 'max_artist_playlists', 'max_total_playlists'):
+            try:
+                setattr(config, key, max(0, int(settings.get(key, getattr(config, key)))))
+            except (TypeError, ValueError):
+                pass
         
         # Apply scheduling settings
         config.auto_generate_on_startup = settings.get('auto_generate_on_startup', getattr(config, 'auto_generate_on_startup', False))

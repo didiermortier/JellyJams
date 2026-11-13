@@ -31,6 +31,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 # Configuration
+SETTINGS_FILE = '/data/config/settings.json'
 
 # --- Name normalization helper ---
 def normalize_name(s: str) -> str:
@@ -126,6 +127,14 @@ class Config:
         self.schedule_weekday = 'sunday'   # weekday name, used by weekly mode
         self.schedule_time = '04:30'       # HH:MM, container local time
         
+        # How many playlists a run may make. The point is quality over quantity: a 10,000
+        # track library otherwise produces well over a hundred genre playlists.
+        self.max_genre_playlists = 14      # the biggest genres, always made
+        self.genre_spotlight_slots = 2     # extra genres from the long tail, rotating weekly
+        self.genre_split_share = 0.25      # a group holding more than this share of the library is split
+        self.max_artist_playlists = 20     # "This is <artist>!", biggest artists first
+        self.max_total_playlists = 45      # genre + decade + artist playlists together
+        
         # Genre grouping/mapping system
         self.genre_grouping_enabled = True
         self.genre_mappings = self._load_genre_mappings()
@@ -135,7 +144,7 @@ class Config:
     
     def load_web_ui_settings(self):
         """Load settings from web UI JSON file - these take precedence over environment variables"""
-        config_file = '/data/config/settings.json'
+        config_file = SETTINGS_FILE
         try:
             if Path(config_file).exists():
                 with open(config_file, 'r') as f:
@@ -204,6 +213,12 @@ class Config:
                     self.trigger_library_scan = bool(web_settings['trigger_library_scan'])
                 if 'genre_grouping_enabled' in web_settings:
                     self.genre_grouping_enabled = bool(web_settings['genre_grouping_enabled'])
+                for key in ('max_genre_playlists', 'genre_spotlight_slots', 'max_artist_playlists',
+                            'max_total_playlists'):
+                    if key in web_settings:
+                        setattr(self, key, max(0, int(web_settings[key])))
+                if 'genre_split_share' in web_settings:
+                    self.genre_split_share = min(1.0, max(0.0, float(web_settings['genre_split_share'])))
                     
                 print(f"🎵  JellyJams web UI settings loaded - overriding environment variables")
                 print(f"   Max tracks: {self.max_tracks_per_playlist}, Min tracks: {self.min_tracks_per_playlist}")
@@ -410,20 +425,23 @@ class Config:
         return normalised
 
     def map_genre_to_group(self, genre):
-        """Map a specific genre to its broader group category"""
+        """Map a specific genre to its broader group category, ignoring case"""
         if not self.genre_grouping_enabled:
             return genre
         
-        # Clean up the genre name
         genre = genre.strip()
         
-        # Search through mappings to find which group this genre belongs to
-        for group_name, genre_list in self.genre_mappings.items():
-            if genre in genre_list:
-                return group_name
+        lookup = getattr(self, '_genre_lookup', None)
+        if lookup is None or getattr(self, '_genre_lookup_source', None) is not self.genre_mappings:
+            lookup = {}
+            for group_name, genre_list in self.genre_mappings.items():
+                for member in genre_list:
+                    lookup.setdefault(member.strip().lower(), group_name)
+            self._genre_lookup = lookup
+            self._genre_lookup_source = self.genre_mappings
         
-        # If no mapping found, return original genre
-        return genre
+        # If no mapping is found the genre stands for itself
+        return lookup.get(genre.lower(), genre)
 
 class SpotifyClient:
     """Spotify API client for downloading cover art"""
@@ -1414,6 +1432,162 @@ class JellyfinAPI:
             self.logger.error(f"Error triggering library scan: {e}")
             return False
 
+# Spellings that mean the same genre. Keys and values are lower case.
+GENRE_ALIASES = {
+    'electronica': 'electronic',
+    'drum and bass': 'drum & bass',
+    'dnb': 'drum & bass',
+    'hiphop': 'hip hop',
+    'hip-hop': 'hip hop',
+    'rnb': 'r&b',
+    'r and b': 'r&b',
+}
+
+# Genres whose plain title case would look wrong.
+GENRE_DISPLAY = {
+    'r&b': 'R&B', 'edm': 'EDM', 'idm': 'IDM', 'dnb': 'DnB', 'uk garage': 'UK Garage',
+    'drum & bass': 'Drum & Bass', 'hip hop': 'Hip Hop', 'k-pop': 'K-Pop', 'j-pop': 'J-Pop',
+    'lo-fi': 'Lo-Fi', 'ebm': 'EBM',
+}
+
+# Credits that name no real artist, so they never get a "This is ...!" playlist.
+NOT_A_REAL_ARTIST = {'various artists', 'various', 'va', 'unknown artist', 'unknown', '[unknown]', 'soundtrack'}
+
+
+def display_genre(tag: str) -> str:
+    """Playlist-friendly spelling of a genre tag: 'hip hop' -> 'Hip Hop', 'r&b' -> 'R&B'."""
+    tag = (tag or '').strip()
+    key = tag.lower()
+    return GENRE_DISPLAY.get(key) or ' '.join(
+        '-'.join(part[:1].upper() + part[1:] for part in word.split('-')) for word in key.split())
+
+
+def parse_track_genres(item: Dict) -> List[str]:
+    """Genres of one track, split on ';' where a tag holds several, without duplicates."""
+    raw = item.get('Genres') or []
+    if isinstance(raw, str):
+        raw = [raw]
+    seen, genres = set(), []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        for part in entry.split(';'):
+            part = part.strip()
+            if part and part.lower() not in seen:
+                seen.add(part.lower())
+                genres.append(part)
+    return genres
+
+
+def select_genre_playlists(config, audio_items: List[Dict], week: Optional[int] = None) -> List[Dict]:
+    """Decide which genre playlists to make. Pure: reads the config, touches no server.
+
+    Tags are compared without regard to case and aliases are merged, so 'Hip Hop' and
+    'hip hop' are one genre. With grouping on, related tags fold into their group
+    (Rock, Pop, Hip Hop ...). A group that holds more than genre_split_share of the whole
+    library is too broad to be one playlist, so its members stand on their own instead:
+    that is what turns a house-heavy library into House, Progressive House, Deep House
+    and so on rather than one giant Electronic.
+
+    The biggest max_genre_playlists genres are always made. genre_spotlight_slots more
+    are taken from the rest and rotate with the ISO week number, so the long tail still
+    gets its turn. Returns [{'genre', 'tracks', 'artists', 'kind'}], best first.
+    """
+    excluded = {g.strip().lower() for g in (config.excluded_genres or []) if g and g.strip()}
+    excluded_artists = set(config.excluded_artists or [])
+    grouping = bool(config.genre_grouping_enabled)
+
+    tag_tracks: Dict[str, Dict[str, Dict]] = {}
+    tag_names: Dict[str, str] = {}
+    all_tracks = set()
+    for item in audio_items:
+        if excluded_artists and any(a in excluded_artists for a in (item.get('Artists') or [])):
+            continue
+        track_id = item.get('Id')
+        if not track_id:
+            continue
+        for tag in parse_track_genres(item):
+            key = GENRE_ALIASES.get(tag.lower(), tag.lower())
+            if key in excluded or tag.lower() in excluded:
+                continue
+            tag_tracks.setdefault(key, {})[track_id] = item
+            tag_names.setdefault(key, tag)
+            all_tracks.add(track_id)
+
+    def group_key(key: str) -> str:
+        return config.map_genre_to_group(key).lower() if grouping else key
+
+    groups: Dict[str, List[str]] = {}
+    for key in tag_tracks:
+        groups.setdefault(group_key(key), []).append(key)
+
+    group_labels = {name.lower(): name for name in (config.genre_mappings or {})}
+    candidates: Dict[str, Dict] = {}
+
+    def add(label_key: str, label: str, pool: Dict[str, Dict]):
+        entry = candidates.setdefault(label_key, {'genre': label, 'pool': {}})
+        entry['pool'].update(pool)
+
+    for gkey, members in groups.items():
+        pool: Dict[str, Dict] = {}
+        for key in members:
+            pool.update(tag_tracks[key])
+        too_broad = (grouping and len(members) > 1 and all_tracks
+                     and len(pool) > config.genre_split_share * len(all_tracks))
+        if too_broad:
+            for key in members:
+                add(key, display_genre(key), tag_tracks[key])
+        else:
+            add(gkey, group_labels.get(gkey) or display_genre(gkey), pool)
+
+    qualifying = []
+    for entry in candidates.values():
+        tracks = list(entry['pool'].values())
+        artists = {a for t in tracks for a in (t.get('Artists') or [])}
+        if len(tracks) >= config.min_tracks_per_playlist and len(artists) >= config.min_artist_diversity:
+            qualifying.append({'genre': entry['genre'], 'tracks': tracks, 'artists': len(artists)})
+
+    qualifying.sort(key=lambda c: (-len(c['tracks']), -c['artists'], c['genre'].lower()))
+    top = qualifying[:config.max_genre_playlists]
+    for entry in top:
+        entry['kind'] = 'top'
+
+    # A spotlight is a treat, not filler: the long tail only qualifies when it holds enough
+    # tracks to make a playlist worth opening.
+    spotlight_min = config.min_tracks_per_playlist * 5
+    rest = sorted((c for c in qualifying[config.max_genre_playlists:] if len(c['tracks']) >= spotlight_min),
+                  key=lambda c: c['genre'].lower())
+    slots = min(config.genre_spotlight_slots, len(rest))
+    spotlight = []
+    if slots > 0:
+        if week is None:
+            week = datetime.now().isocalendar()[1]
+        start = (week * slots) % len(rest)
+        spotlight = [rest[(start + i) % len(rest)] for i in range(slots)]
+        for entry in spotlight:
+            entry['kind'] = 'spotlight'
+    return top + spotlight
+
+
+def select_artist_playlists(config, artist_data: Dict[str, Dict], limit: int) -> List[str]:
+    """The artists that get a "This is <artist>!" playlist: biggest first, at most `limit`.
+
+    artist_data maps an artist to {'tracks': [...], 'albums': set(...)}.
+    """
+    excluded = set(config.excluded_artists or [])
+    eligible = []
+    for artist, data in artist_data.items():
+        if artist in excluded or artist.strip().lower() in NOT_A_REAL_ARTIST:
+            continue
+        if len(data['tracks']) < config.min_tracks_per_playlist:
+            continue
+        if len(data['albums']) < config.min_albums_per_artist:
+            continue
+        eligible.append(artist)
+    eligible.sort(key=lambda a: (-len(artist_data[a]['tracks']), -len(artist_data[a]['albums']), a.lower()))
+    return eligible[:max(0, limit)]
+
+
 class PlaylistGenerator:
     def __init__(self, config: Config, logger):
         self.config = config
@@ -1421,6 +1595,8 @@ class PlaylistGenerator:
         # What a dry run found: one entry per playlist this run would create, replace
         # or skip. Stays empty on a normal run.
         self.dry_run_plan: List[Dict] = []
+        # Genre, decade and artist playlists chosen so far this run, for max_total_playlists
+        self.shared_planned = 0
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
@@ -2627,82 +2803,28 @@ class PlaylistGenerator:
             return None
 
     def generate_genre_playlists(self, audio_items: List[Dict]):
-        """Generate playlists by genre with genre grouping/mapping support"""
+        """Generate the genre playlists: the biggest genres plus a few rotating spotlights"""
         self.logger.info("🎵 Generating genre-based playlists...")
+        self.logger.info(
+            f"🔧 Up to {self.config.max_genre_playlists} genres plus {self.config.genre_spotlight_slots} "
+            f"spotlight(s), grouping {'on' if self.config.genre_grouping_enabled else 'off'}"
+        )
         
-        if self.config.genre_grouping_enabled:
-            self.logger.info(f"🔄 Genre grouping enabled - consolidating {len(self.config.genre_mappings)} genre groups")
-        else:
-            self.logger.info("📋 Genre grouping disabled - using individual genres")
+        selected = select_genre_playlists(self.config, audio_items)
+        room = max(0, self.config.max_total_playlists - self.shared_planned)
+        if len(selected) > room:
+            self.logger.info(f"Total playlist cap ({self.config.max_total_playlists}): keeping {room} of {len(selected)} genres")
+            selected = selected[:room]
         
-        # Group tracks by genre (with optional mapping to consolidated groups)
-        genre_tracks = {}
-        original_genre_stats = {}  # Track original genre distribution for logging
-        
-        for item in audio_items:
-            if not item.get('Genres'):
-                continue
-            
-            # Check if any artist in this track is excluded
-            if self.config.excluded_artists and item.get('Artists'):
-                excluded_artist_found = False
-                for artist in item['Artists']:
-                    if artist in self.config.excluded_artists:
-                        excluded_artist_found = True
-                        break
-                if excluded_artist_found:
-                    continue
-            
-            # Parse genres - handle both list and semicolon-separated string formats
-            genres = []
-            if isinstance(item['Genres'], list):
-                for genre_item in item['Genres']:
-                    if isinstance(genre_item, str) and ';' in genre_item:
-                        # Split semicolon-separated genres
-                        genres.extend([g.strip() for g in genre_item.split(';') if g.strip()])
-                    elif isinstance(genre_item, str):
-                        genres.append(genre_item.strip())
-            elif isinstance(item['Genres'], str):
-                if ';' in item['Genres']:
-                    genres = [g.strip() for g in item['Genres'].split(';') if g.strip()]
-                else:
-                    genres = [item['Genres'].strip()]
-            
-            # Add track to each genre it belongs to (with optional mapping)
-            for original_genre in genres:
-                if original_genre and original_genre not in self.config.excluded_genres:
-                    # Track original genre stats
-                    original_genre_stats[original_genre] = original_genre_stats.get(original_genre, 0) + 1
-                    
-                    # Map to consolidated genre group if grouping is enabled
-                    final_genre = self.config.map_genre_to_group(original_genre)
-                    
-                    if final_genre not in genre_tracks:
-                        genre_tracks[final_genre] = []
-                    genre_tracks[final_genre].append(item)
-        
-        # Create playlists for each genre
-        for genre, tracks in genre_tracks.items():
-            if len(tracks) < self.config.min_tracks_per_playlist:
-                continue
-            
-            # Check artist diversity - count unique artists in this genre
-            unique_artists = set()
-            for track in tracks:
-                if track.get('Artists'):
-                    for artist in track['Artists']:
-                        unique_artists.add(artist)
-            
-            if len(unique_artists) < self.config.min_artist_diversity:
-                self.logger.info(f"Skipping genre '{genre}' - only {len(unique_artists)} artists (minimum: {self.config.min_artist_diversity})")
-                continue
-                
-            # Pick a random sample of the pool (see _select_tracks)
-            limited_tracks = self._select_tracks(tracks)
-            
-            playlist_name = f"{genre} Radio"
-            self.save_playlist("Genre", playlist_name, limited_tracks)
-            self.logger.info(f"Created genre playlist '{playlist_name}' with {len(limited_tracks)} tracks from {len(unique_artists)} artists")
+        for entry in selected:
+            playlist_name = f"{entry['genre']} Radio"
+            tracks = self._select_tracks(entry['tracks'])
+            self.shared_planned += 1
+            self.save_playlist("Genre", playlist_name, tracks)
+            self.logger.info(
+                f"Genre playlist '{playlist_name}' ({entry['kind']}): {len(tracks)} tracks "
+                f"from a pool of {len(entry['tracks'])} by {entry['artists']} artists"
+            )
 
     def generate_year_playlists(self, audio_items: List[Dict]):
         """Generate playlists by decade (1980s, 1990s, 2000s, etc.)"""
@@ -2778,7 +2900,12 @@ class PlaylistGenerator:
             # Pick a random sample of the pool (see _select_tracks)
             limited_tracks = self._select_tracks(tracks)
             
+            if self.shared_planned >= self.config.max_total_playlists:
+                self.logger.info(f"⏭️  Skipping decade '{decade}': total playlist cap ({self.config.max_total_playlists}) reached")
+                continue
+            
             playlist_name = f"Back to the {decade}"
+            self.shared_planned += 1
             self.save_playlist("Decade", playlist_name, limited_tracks)
             created_playlists += 1
             self.logger.info(f"✅ Created decade playlist '{playlist_name}' with {len(limited_tracks)} tracks from {len(unique_albums)} albums and {len(unique_artists)} artists")
@@ -2818,8 +2945,6 @@ class PlaylistGenerator:
             item['Artists'] = parsed_artists
             
             for artist in parsed_artists:
-                if 'Old Mervs' in artist:
-                    self.logger.info(f"[DEBUG] Found 'Old Mervs' during collection: {repr(artist)}")
                 if artist not in artist_data:
                     artist_data[artist] = {'tracks': [], 'albums': set()}
                 artist_data[artist]['tracks'].append(item)
@@ -2834,56 +2959,27 @@ class PlaylistGenerator:
         
         self.logger.info(f"📊 Processed {processed_items} audio items, found {len(artist_data)} unique artists")
         
-        # Create playlists for each artist that meets requirements
+        # Create playlists for the biggest artists that meet the requirements
         created_playlists = 0
         skipped_artists = []
         
-        for artist, data in artist_data.items():
+        room = max(0, self.config.max_total_playlists - self.shared_planned)
+        limit = min(self.config.max_artist_playlists, room)
+        chosen = select_artist_playlists(self.config, artist_data, limit)
+        self.logger.info(f"🎤 {len(chosen)} artist playlist(s) selected (cap {self.config.max_artist_playlists}, room under the total cap {room})")
+        
+        for artist in chosen:
+            data = artist_data[artist]
             tracks = data['tracks']
-            album_count = len(data['albums'])
-            
-            # Debug logging for artist name
-            self.logger.debug(f"Processing artist: {repr(artist)}")
-            
-            # Check if artist is excluded
-            if self.config.excluded_artists and artist in self.config.excluded_artists:
-                self.logger.info(f"⏭️  Skipping excluded artist: {artist}")
-                skipped_artists.append(f"{artist} (excluded)")
-                continue
-            
-            # Check minimum track requirement
-            if len(tracks) < self.config.min_tracks_per_playlist:
-                self.logger.debug(f"Skipping {artist}: only {len(tracks)} tracks (minimum: {self.config.min_tracks_per_playlist})")
-                continue
-            
-            # Check minimum album requirement
-            if album_count < self.config.min_albums_per_artist:
-                self.logger.info(f"⏭️  Skipping {artist}: only {album_count} albums (minimum: {self.config.min_albums_per_artist})")
-                skipped_artists.append(f"{artist} ({album_count} albums)")
-                continue
-            
-            self.logger.info(f"✅ Creating playlist for {artist}: {len(tracks)} tracks from {album_count} albums")
-            
-            # Debug album information
-            self.logger.debug(f"Albums for {artist}: {list(data['albums'])}")
+            self.logger.info(f"✅ Creating playlist for {artist}: {len(tracks)} tracks from {len(data['albums'])} albums")
             
             # Pick a random sample of the pool (see _select_tracks)
             limited_tracks = self._select_tracks(tracks)
-            
-            # Create playlist name and log it for debugging
             playlist_name = f"This is {artist}!"
-            if 'Old Mervs' in artist:
-                self.logger.info(f"[DEBUG] Pre-sanitization name for 'Old Mervs': {repr(playlist_name)}")
-            self.logger.debug(f"Generated playlist name: {repr(playlist_name)}")
-            
+            self.shared_planned += 1
             playlist_dir = self.save_playlist("Artist", playlist_name, limited_tracks)
-            
             if playlist_dir:
                 created_playlists += 1
-                if 'Old Mervs' in artist:
-                    self.logger.info(f"[DEBUG] Successfully saved playlist for 'Old Mervs' in directory: {playlist_dir}")
-            elif 'Old Mervs' in artist:
-                self.logger.error(f"[DEBUG] Failed to save playlist for 'Old Mervs'. `save_playlist` returned None.")
         
         # Summary logging
         self.logger.info(f"🎤 Artist playlist generation complete: {created_playlists} playlists created")
@@ -3187,6 +3283,7 @@ class PlaylistGenerator:
         """Main playlist generation function. Returns counts, or None if it aborted."""
         self.created_playlists = 0
         self.dry_run_plan = []
+        self.shared_planned = 0
         if self.config.dry_run:
             self.logger.info("🔎 DRY RUN: reading the library, writing nothing to Jellyfin or /data")
         self.adopt_existing_playlists()
