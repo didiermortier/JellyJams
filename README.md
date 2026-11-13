@@ -47,7 +47,7 @@ Open `http://<your-server>:5000`.
 - `PUID` and `PGID` are the user and group Jellyfin runs as, so both can read and write the playlists folder.
 - `TZ` is your timezone. Schedule times use the container's clock.
 
-The included `docker-compose.yml` and `.env.example` set the same things from a `.env` file. They point at the original project's image, so change the `image:` line to `jellyjams` (or to your own build) first. On Unraid, see `docker-compose-unraid.yml`.
+Or use Compose: copy `.env.example` to `.env`, fill it in, and run `docker compose up -d --build`. It builds the image from this repository. On Unraid, use `docker-compose-unraid.yml` the same way.
 
 Everything else is set on the Settings page and has a default that works. Nothing is generated until the schedule fires or you press **Generate now**. Press **Preview (dry run)** first if you want to see what it would do.
 
@@ -122,6 +122,6 @@ tools/make_genre_covers.py   how the shipped covers were drawn
 
 ## License and credits
 
-GPL-3.0, see [app/LICENSE](app/LICENSE). Original project by [jonasmore](https://github.com/jonasmore/jellyjams). Built with [Jellyfin](https://jellyfin.org/), [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), [Inter](https://rsms.me/inter/) and [DejaVu Sans](https://dejavu-fonts.github.io/). Cover backgrounds are [Unsplash](https://unsplash.com/license) photos.
+GPL-3.0, see [LICENSE](LICENSE). Original project by [jonasmore](https://github.com/jonasmore/jellyjams). Built with [Jellyfin](https://jellyfin.org/), [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), [Inter](https://rsms.me/inter/) and [DejaVu Sans](https://dejavu-fonts.github.io/). Cover backgrounds are [Unsplash](https://unsplash.com/license) photos.
 
 Questions and bugs: [open an issue](https://github.com/didiermortier/JellyJams/issues).

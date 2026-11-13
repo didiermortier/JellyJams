@@ -6,7 +6,8 @@ COPY app /app
 RUN chmod +x /app/*.sh
 
 # Install required packages
-RUN apk add --no-cache su-exec
+# tzdata: without it the TZ variable is ignored and schedule times run on UTC
+RUN apk add --no-cache su-exec tzdata
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Set environment variables
