@@ -18,7 +18,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import base64
 import shutil
 from vibecodeplugin import (Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient,
-                            DeezerClient, is_generated_playlist_name, load_managed_playlists)
+                            DeezerClient, is_generated_playlist_name, load_managed_playlists,
+                            categorize_playlist)
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -1435,14 +1436,15 @@ def get_playlist_stats():
     try:
         playlist_dir = Path(config.playlist_folder)
         if not playlist_dir.exists():
-            return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0}
+            return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
         
         stats = {
             'total': 0,
             'genre': 0,
             'year': 0,
             'artist': 0,
-            'personal': 0
+            'personal': 0,
+            'manual': 0
         }
         
         for playlist_path in playlist_dir.iterdir():
@@ -1452,24 +1454,12 @@ def get_playlist_stats():
                     playlist_name = playlist_path.name
                     stats['total'] += 1
                     
-                    # Use same categorization logic as get_detailed_playlist_info
-                    if playlist_name.startswith('This is '):
-                        stats['artist'] += 1
-                    elif playlist_name.startswith('Back to the '):
-                        stats['year'] += 1
-                    elif playlist_name in ['Top Tracks - all', 'Discovery Mix', 'Recent Favorites', 'Genre Mix']:
-                        stats['personal'] += 1
-                    else:
-                        # Check if it's a genre playlist (not starting with special prefixes)
-                        if not any(playlist_name.startswith(prefix) for prefix in ['This is ', 'Back to the ', 'Top Tracks', 'Discovery', 'Recent', 'Genre']):
-                            stats['genre'] += 1
-                        else:
-                            stats['personal'] += 1
+                    stats[categorize_playlist(playlist_name)] += 1
         
         return stats
     except Exception as e:
         logger.error(f"Error getting playlist stats: {e}")
-        return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0}
+        return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
 
 def get_detailed_playlist_info():
     """Get detailed playlist information with proper categorization"""
@@ -1483,7 +1473,8 @@ def get_detailed_playlist_info():
                     'genre': 0,
                     'year': 0,
                     'artist': 0,
-                    'personal': 0
+                    'personal': 0,
+                    'manual': 0
                 }
             }
         
@@ -1493,7 +1484,8 @@ def get_detailed_playlist_info():
             'genre': 0,
             'year': 0,
             'artist': 0,
-            'personal': 0
+            'personal': 0,
+            'manual': 0
         }
         
         for playlist_path in playlist_dir.iterdir():
@@ -1604,27 +1596,10 @@ def get_detailed_playlist_info():
                         # If snapshot logic fails, just omit deltas
                         pass
                     
-                    # Determine playlist category
+                    # Same rules as the dashboard tiles, see categorize_playlist
                     playlist_name = playlist_path.name
-                    category = 'personal'  # Default category
-                    
-                    if playlist_name.startswith('This is '):
-                        category = 'artist'
-                        stats['artist'] += 1
-                    elif playlist_name.startswith('Back to the '):
-                        category = 'year'
-                        stats['year'] += 1
-                    elif playlist_name in ['Top Tracks - all', 'Discovery Mix', 'Recent Favorites', 'Genre Mix']:
-                        category = 'personal'
-                        stats['personal'] += 1
-                    else:
-                        # Check if it's a genre playlist (not starting with special prefixes)
-                        # Genre playlists are typically just the genre name
-                        if not any(playlist_name.startswith(prefix) for prefix in ['This is ', 'Back to the ', 'Top Tracks', 'Discovery', 'Recent', 'Genre']):
-                            category = 'genre'
-                            stats['genre'] += 1
-                        else:
-                            stats['personal'] += 1
+                    category = categorize_playlist(playlist_name)
+                    stats[category] += 1
                     
                     stats['total'] += 1
                     

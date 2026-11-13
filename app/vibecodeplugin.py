@@ -748,24 +748,38 @@ RUN_STATUS_FILE = '/data/run_status.json'
 MANAGED_PLAYLISTS_FILE = '/data/managed_playlists.json'
 
 
+PERSONAL_PLAYLIST_PREFIXES = ('Top Tracks - ', 'Discovery Mix - ', 'Recent Favorites - ', 'Genre Mix - ')
+
+
+def categorize_playlist(name: str) -> str:
+    """File a playlist name under the kind JellyJams generates, or 'manual'.
+
+    Returns 'genre', 'year', 'artist' or 'personal' for the four name patterns
+    save_playlist is called with: "<genre> Radio", "Back to the <decade>s",
+    "This is <artist>!" and the four personal mixes. Anything else is 'manual', a
+    playlist somebody made by hand. The dashboard counts with this, and
+    is_generated_playlist_name is built on it, so both always agree.
+    """
+    if not name:
+        return 'manual'
+    if name.startswith(PERSONAL_PLAYLIST_PREFIXES):
+        return 'personal'
+    if name.startswith('This is ') and name.endswith('!'):
+        return 'artist'
+    if re.match(r'^Back to the \d+s$', name):
+        return 'year'
+    if name.endswith(' Radio'):
+        return 'genre'
+    return 'manual'
+
+
 def is_generated_playlist_name(name: str) -> bool:
     """True when a name is one JellyJams itself creates.
 
     This is the first guard before anything is deleted, so a playlist made by hand can
-    never be removed even if a generated one wants the same name. The patterns match
-    what save_playlist is called with: "<genre> Radio", "Back to the <decade>s",
-    "This is <artist>!" and the four personal mixes.
+    never be removed even if a generated one wants the same name.
     """
-    if not name:
-        return False
-    if name.endswith(' Radio'):
-        return True
-    if re.match(r'^Back to the \d+s$', name):
-        return True
-    if name.startswith('This is ') and name.endswith('!'):
-        return True
-    return any(name.startswith(prefix) for prefix in
-               ('Top Tracks - ', 'Discovery Mix - ', 'Recent Favorites - ', 'Genre Mix - '))
+    return categorize_playlist(name) != 'manual'
 
 
 def load_managed_playlists() -> Dict[str, str]:
