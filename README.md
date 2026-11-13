@@ -1,397 +1,127 @@
-# JellyJams 🎵
 <p align="center">
-  <img src="jellyjams.jpeg" alt="JellyJams Logo" />
+  <img src="jellyjams.jpeg" alt="JellyJams logo" width="220" />
 </p>
 
-> **Fork note (didiermortier/JellyJams).** Upstream is unmaintained since Nov 2025. This fork keeps
-> it running on Jellyfin 12.1 and adds a Deezer cover art source.
->
-> Changes against upstream:
->
-> 1. `app/vibecodeplugin.py`: authenticate with the standard
->    `Authorization: MediaBrowser Token=...` header. The old `X-Emby-Token` header that upstream
->    sends is rejected with HTTP 401 by Jellyfin 12 (the legacy auth scheme was disabled in 12.0),
->    which made every generation run abort at "Cannot connect to Jellyfin".
-> 2. `app/webapp.py`: `POST /api/settings` used to write the request body straight to
->    `settings.json`, so a partial update deleted every setting it did not contain. It now merges.
-> 3. `genre_grouping_enabled` is a setting instead of hardcoded on, exposed as a checkbox. Off
->    means every genre gets its own playlist instead of all subgenres folding into "Electronic
->    Radio".
-> 4. New `DeezerClient`: artist cover art from the public Deezer API (`api.deezer.com`), which
->    needs no account and no API key, unlike the Spotify search endpoint that returns 403 without a
->    paid app subscription. Enabled with `deezer_cover_art_enabled`, tried before Spotify for
->    "This is <artist>!" playlists.
-> 5. Playlists are replaced safely: the new playlist is created first and the older copy is only
->    removed once that succeeded, so a failed create cannot lose a playlist. Upstream deleted first.
-> 6. `random_track_selection` (default on) takes a random sample when a genre or decade holds more
->    tracks than the maximum. Upstream always took the first N in library order, so a scheduled run
->    produced the same songs every time.
-> 7. Weekly scheduling. `schedule_mode` now accepts manual, daily, weekly (default) or interval, with
->    `schedule_weekday` choosing the day. The default time is 04:30 in the container's timezone, so
->    set the `TZ` environment variable.
-> 8. Each run records its outcome to `/data/run_status.json`, exposed at `GET /api/health` (503 when
->    the last run failed) and used by the container `HEALTHCHECK`, so a failed scheduled run shows up
->    in any monitoring tool rather than only in the log.
-> 9. Personal playlists read real play counts from the **Playback Reporting** plugin, walking only
->    the days that have activity and counting audio plays per track. `listening_window_days`
->    (default 90) is widened to 365 when it holds too little, then falls back to favourites and
->    recently played exactly as upstream did, so a quiet month does not empty the playlist. A
->    missing plugin behaves the same as no listening history.
-> 10. **Playlists JellyJams did not create are never touched.** A playlist is only replaced or
->    deleted when its id is in `/data/managed_playlists.json`, which records the id of every
->    playlist JellyJams creates, and when its name is one JellyJams generates. A name alone never
->    proves anything: a same-named playlist that is not in the record is left alone and the
->    replacement is skipped instead of being turned into a duplicate. A playlist of your own,
->    named anything else, can never be removed. Nothing is adopted automatically. If you are
->    upgrading from a version that kept no record, set `ADOPT_EXISTING_PLAYLISTS=true` for one run
->    to take over the generated names already on the server (each one is logged), then turn it off.
-> 11. **Dry run.** `docker exec <container> python /app/vibecodeplugin.py --dry-run` does one full
->    pass and writes nothing to Jellyfin or `/data`: no playlists, no covers, no record, no library
->    scan, no status file. It logs what it would create, replace and skip, and lists generated-looking
->    playlists it has no record of.
-> 12. **Fewer, better genre and artist playlists.** Genre tags are compared without regard to case
->    and aliases are merged (`Hip Hop` and `hip hop` are one genre). The biggest 14 genres
->    (`max_genre_playlists`) are always made, plus 2 spotlight genres (`genre_spotlight_slots`) that
->    rotate every week through the smaller ones. A genre group that holds more than a quarter of the
->    library is too broad to be one playlist, so its members stand alone: a house-heavy library gets
->    House, Progressive House and Deep House instead of one huge Electronic. Artist playlists go to
->    the 20 artists with the most tracks (`max_artist_playlists`), and genre, decade and artist
->    playlists together never exceed `max_total_playlists` (45). All of these are on the settings
->    page. Personal mixes are not counted.
-> 13. **Retiring old playlists.** Playlists JellyJams made earlier that a run no longer generates (the
->    old per-genre playlists, for example) are listed by `--dry-run` under "Would RETIRE". They are
->    only removed by `docker exec <container> python /app/vibecodeplugin.py --retire-stale`, or on
->    every run with `RETIRE_STALE_PLAYLISTS=true`. Only playlists in the record, still under the same
->    name, are retired; personal mixes, hand-made playlists and any kind of playlist the run made none
->    of are never touched. To clean up an install that has no record yet, run with
->    `ADOPT_EXISTING_PLAYLISTS=true`: the dry run then shows exactly what adopting and retiring would do.
-> 14. **Preview from the dashboard.** The "Preview (dry run)" button on the dashboard shows what the
->    next run would create, replace, skip and retire, and changes nothing. `POST /api/dry_run` does the
->    same, and `POST /api/retire_stale` runs one retire pass.
-> 15. **One process, fewer dependencies.** The container runs the web UI as a single process, so the
->    generator and the UI share `/data/run_status.json`. `requirements.txt` lists only what the code
->    imports. Artist covers use the same renderer and bundled font as the genre covers.
-> 16. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
->    playlists included, and it removed only the folders: the Jellyfin items stayed and the scanner
->    brought them back as empty playlists. That is one way playlists end up present but empty. It now
->    deletes only generated names from the managed record, through the API, and reports what it left
->    alone. The button reads "Delete Generated".
+# JellyJams
 
-**JellyJams** is a modern, standalone Docker container that automatically generates music playlists for your Jellyfin media server using the Jellyfin REST API. It features a beautiful dark-themed web UI for easy configuration and management.
+JellyJams makes music playlists for your [Jellyfin](https://jellyfin.org/) server on a schedule: one for each of your main genres, one for each decade, one for each of your most-played artists, and private mixes for each user. It runs as one small Docker container with a web page for settings. There is no cloud service and no AI. The playlists come from your own library.
 
-![JellyJams Web UI](https://img.shields.io/badge/Web%20UI-Modern%20Dark%20Theme-8b5cf6)
-![Docker](https://img.shields.io/badge/Docker-Containerized-2496ed)
-![Docker Pulls](https://img.shields.io/docker/pulls/jonasmore/jellyjams?color=2496ed)
-![Jellyfin](https://img.shields.io/badge/Jellyfin-API%20Integration-00a4dc)
+![What it makes in Jellyfin](example.jpg)
 
-![JellyJams Example](example.jpg)
+This is a maintained fork of [jonasmore/jellyjams](https://github.com/jonasmore/jellyjams), which is no longer updated. It works with Jellyfin 12 and adds safer handling of your own playlists, fewer and better playlists, shipped cover art and a clearer web page.
 
-## 🚧 Alpha Status & Feedback
-JellyJams is currently in alpha. It's working well for me, but as my first coding project, I'm sure there are improvements to be made!
-I'd love your feedback on:
-- Installation experience
-- Feature requests
-- Performance with large libraries
-- UI/UX suggestions
+## What you get
 
+- **Genre playlists** such as "House Radio" and "Hip Hop Radio". By default the 14 biggest genres, plus 2 "spotlight" genres that rotate every week.
+- **Decade playlists** such as "Back to the 1980s".
+- **Artist playlists** such as "This is Usher!", for your 20 artists with the most tracks.
+- **Personal mixes** for each user (top tracks, discovery, recent favourites, genre mix). These need the [Playback Reporting plugin](https://github.com/jellyfin/jellyfin-plugin-playbackreporting) in Jellyfin.
+- **Covers** for every playlist. Genre and decade covers ship with the app. Artist covers are the artist's photo with "THIS IS / Artist" on it.
+- A **web page** to see what exists, preview a run, change settings and read the log. It works on a phone.
 
-## ⚠️ Important Update (2025-09-09)
+Playlists you made yourself are never changed or deleted. See [Your own playlists are safe](#your-own-playlists-are-safe).
 
-We changed how folders are bound into the container to simplify setup and improve compatibility.
+## Quick start
 
-- Update your `.env` to use these variables:
-  - `JELLYJAMS_DATA_DIR_HOST=/mnt/user/appdata/jelljams`
-  - `PLAYLIST_DIR_HOST=/mnt/user/appdata/jellyfin/data/playlists`
-  - `MUSIC_DIR_HOST=/path/to/your/music` (e.g., `/mnt/user/media/data/music`)
-  - `MUSIC_DIR_CONTAINER=/path/to/your/music` (must match the path that Jellyfin uses inside its container)
-- The old `PLAYLIST_FOLDER` environment variable is no longer used. Please remove it if present.
-- Most of the playlist settings have been moved to web UI only. Please reference `.env.example`.
-- Compose volumes should look like this:
-  - Host app data → `/data`
-  - Jellyfin playlists → `/playlists`
-  - Music (read-only) → `${MUSIC_DIR_HOST}:${MUSIC_DIR_CONTAINER}:ro`
-
-See `SETTINGS.md` → Docker Volume Configuration for full details and Unraid examples.
-
-### Early Development Notice
-
-This project is evolving rapidly. Things may change significantly between releases. Always review the latest `README.md` and `SETTINGS.md` when upgrading to ensure your environment variables and volume mappings are correct.
-
-## 🐳 Quick Start
-
-Get JellyJams running in minutes with Docker:
-
-Replace the placeholder paths with your real host directories:
+You need Docker, a Jellyfin API key (Jellyfin dashboard, API Keys) and three folders: where JellyJams keeps its data, Jellyfin's `playlists` folder, and your music.
 
 ```bash
-docker run -d \
-  --name jellyjams \
-  -p 5000:5000 \
+git clone https://github.com/didiermortier/JellyJams.git
+cd JellyJams
+docker build -t jellyjams .
+
+docker run -d --name jellyjams -p 5000:5000 \
   -e JELLYFIN_URL=http://jellyfin:8096 \
-  -e JELLYFIN_API_KEY=YOUR_API_KEY \
-  -v /path/to/appdata/jellyjams:/data \
+  -e JELLYFIN_API_KEY=your-key \
+  -e TZ=Europe/Brussels \
+  -e PUID=1000 -e PGID=1000 \
+  -v /path/to/jellyjams-data:/data \
   -v /path/to/jellyfin/config/data/playlists:/playlists \
-  jonasmore/jellyjams
+  -v /path/to/music:/path/to/music:ro \
+  jellyjams
 ```
 
-📦 **Docker Hub**: [jonasmore/jellyjams](https://hub.docker.com/r/jonasmore/jellyjams)
-## ✨ Features
+Open `http://<your-server>:5000`.
 
-### 🎵 Playlist Generation
-- **Multiple Playlist Types** - Genre, Year, Artist, and Personalized playlists
-- **Smart Genre Grouping** - Groups similar genres into main categories to avoid overly specific playlists (e.g., "Alternative Rock", "Indie Rock", "Classic Rock" → "Rock Radio")
-- **Smart Naming** - Clean playlist names ("Rock Radio", "Back to 1980", "This is Beatles!")
-- **Artist Diversity Control** - Configurable minimum artist diversity for genre/year playlists
-- **Discovery Playlists** - Personalized recommendations with diversity controls (max songs per album/artist)
-- **Jellyfin API Integration** - Creates playlists directly via REST API with proper privacy controls
+- The music folder must be mounted at the **same path Jellyfin sees it under**, so track paths match.
+- `PUID` and `PGID` are the user and group Jellyfin runs as, so both can read and write the playlists folder.
+- `TZ` is your timezone. Schedule times use the container's clock.
 
-### 👤 Personalized Features
-- **User-Specific Playlists** - Private playlists based on individual listening habits
-- **Multiple Playlist Types** - Top Tracks, Discovery Mix, Recent Favorites, Genre Mix
-- **User Selection** - Choose specific users or generate for all users
-- **Listening Analytics** - Based on play counts, favorites, and recent activity
-- **Plugin Requirement** - Requires [Jellyfin Playback Reporting Plugin](https://github.com/jellyfin/jellyfin-plugin-playbackreporting) for listening statistics
+The included `docker-compose.yml` and `.env.example` set the same things from a `.env` file. They point at the original project's image, so change the `image:` line to `jellyjams` (or to your own build) first. On Unraid, see `docker-compose-unraid.yml`.
 
-### 🎨 Cover Art System
-- **Multi-Tier Cover Art System** - Comprehensive fallback system for all playlist types
-- **Custom Generated Covers** - "This is [Artist]" text overlays on artist folder images
-- **Spotify Integration** - Automatic artist playlist cover downloads from Spotify
-- **Predefined Custom Covers** - Manual cover art for specific playlists
-- **Smart Fallbacks** - Generic covers per playlist type ("Top Tracks - all.ext")
-- **Multi-format Support** - Searches for images in multiple formats (JPG, JPEG, PNG, WebP, AVIF, BMP)
-- **Artist Folder Integration** - Uses existing folder.ext from music directories
-- **Unicode Support** - Handles special characters in artist names (alt‐J, Sigur Rós, etc.)
-- **Extension Preservation** - Maintains original image format when copying.
-- **Generated Image Format** - Saves generated images as WebP for high quality and compression.
+Everything else is set on the Settings page and has a default that works. Nothing is generated until the schedule fires or you press **Generate now**. Press **Preview (dry run)** first if you want to see what it would do.
 
-### 🌐 Modern Web Interface
-- **Beautiful Dark Theme** - Modern, responsive design
-- **Real-time Dashboard** - Connection status, playlist stats, and monitoring
-- **Advanced Settings** - Comprehensive configuration with live validation
-- **User Management** - Select users for personalized playlists
-- **Playlist Viewing** - Browse playlist contents directly in the web UI
+## Defaults
 
-### ⚙️ Smart Configuration
-- **Web UI Override** - Settings page overrides environment variables
-- **Live Updates** - Changes apply immediately without container restart
-- **Comprehensive Options** - 25+ configurable settings
-- **Privacy Controls** - Separate settings for public vs private playlists
+| | |
+| --- | --- |
+| Schedule | Weekly, Sunday at 04:30 (also: daily, every N hours, or manual only) |
+| Genre playlists | 14, plus 2 rotating spotlight genres |
+| Artist playlists | 20 |
+| Playlists in total | 45 genre, decade and artist playlists together (personal mixes not counted) |
+| Tracks per playlist | 5 to 100, picked at random from a bigger pool |
+| Similar genres | Grouped, so "Classic Rock" and "Hard Rock" become "Rock Radio". A group that would swallow more than a quarter of the library is split again. Turn off "Group similar genres into one playlist" to give every genre its own playlist |
 
-### 🔄 Automation & Integration
-- **Scheduled Generation** - Configurable automatic playlist updates (default: 24 hours)
-- **Media Library Scan** - Automatic Jellyfin library refresh after playlist creation
-- **Docker Ready** - Easy deployment with Docker Compose
-- **Unraid Support** - Dedicated docker-compose configuration
-- **Comprehensive Logging** - Detailed operation tracking and debugging
-- **Discord Notifications** - Optional Discord webhook notifications for playlist updates and cover art changes
+Genre tags are compared without regard to case, so `Hip Hop` and `hip hop` count as one genre.
 
-## 🔒 Web UI Security
+## Your own playlists are safe
 
-JellyJams includes optional basic authentication to protect the web interface:
+- JellyJams keeps a list of the playlists it created (`/data/managed_playlists.json`). It only replaces or deletes a playlist that is on that list **and** has a name it generates. A name alone never proves anything.
+- A playlist of yours with a generated-looking name, for example "Techno Radio", is left alone. The run skips that name instead of making a duplicate.
+- **Update covers** and **Delete generated** only act on playlists from that list.
+- Replacing is safe: the new playlist is created first and the old one is removed only when that worked.
+- Upgrading from a version that kept no list: set `ADOPT_EXISTING_PLAYLISTS=true` for one run so JellyJams takes over the generated names already on the server (each one is logged), then set it back to `false`.
 
-### Basic Authentication
-- **Default**: Disabled for easy setup
-- **Configuration**: Via environment variables only
+## Preview and clean up
 
-#### Environment Variables
-```bash
-WEBUI_BASIC_AUTH_ENABLED=true
-WEBUI_BASIC_AUTH_USERNAME=your_username
-WEBUI_BASIC_AUTH_PASSWORD=your_password
-```
+- **Preview (dry run)** on the dashboard, or `docker exec jellyjams python /app/vibecodeplugin.py --dry-run`. It reads your library and writes nothing. It lists what a run would create, replace, skip and retire.
+- **Retiring old playlists.** When you lower a cap or switch a type off, playlists from earlier runs stay until you retire them. The dry run lists them under "Would retire". Remove them with `docker exec jellyjams python /app/vibecodeplugin.py --retire-stale`, or set `RETIRE_STALE_PLAYLISTS=true` to do it on every run. Only playlists from the list above are retired. Personal mixes and hand-made playlists never are.
 
-## 🎨 Cover Art System
-- **Multi-Tier Cover Art System** - Comprehensive fallback system for all playlist types
-- **Custom Generated Covers** - "This is [Artist]" text overlays on artist folder images
-- **Spotify Integration** - Automatic artist playlist cover downloads from Spotify
-- **Predefined Custom Covers** - Manual cover art for specific playlists
-- **Smart Fallbacks** - Generic covers per playlist type ("Top Tracks - all.ext")
-- **Multi-format Support** - Searches for images in multiple formats (JPG, JPEG, PNG, WebP, AVIF, BMP)
-- **Artist Folder Integration** - Uses existing folder.ext from music directories
-- **Unicode Support** - Handles special characters in artist names (alt‐J, Sigur Rós, etc.)
-- **Extension Preservation** - Maintains original image format when copying.
-- **Generated Image Format** - Saves generated images as WebP for high quality and compression.
+## Covers
 
-### 🎯 Cover Art Priority System
-1. **Custom Generated Covers** (Artist playlists)
-2. **Spotify Cover Art** (Artist playlists, if enabled)
-3. **Predefined Custom Covers** (Manual covers)
-4. **Artist Folder Fallback** (Uses existing folder.ext)
-5. **Generic Fallbacks** (Type-specific defaults)
+- **Genre and decade:** drawn once and shipped in `app/cover`. On start, new ones are copied into `/data/cover` without overwriting anything. To use your own image, put a file with the playlist's name in `/data/cover`, for example `Jazz Radio.jpg`.
+- **Artist:** the photo comes from Deezer's public API (no account or key). The artist's name is drawn on it with a bundled font. Switch the name off on the Settings page to keep the plain photo. If Deezer has nothing, the artist's own `folder.jpg` from your music folder is used.
+- **Spotify** is optional and tried after Deezer. Its artist search needs a developer app whose owner has a Premium subscription.
 
-#### 🖼️ Custom Generated Covers
-For artist playlists, JellyJams automatically generates professional "This is [Artist]" covers:
-- Uses artist's existing folder.ext as background
-- Adds stylized text overlay with adaptive colors
-- Handles Unicode characters (alt‐J, Sigur Rós, Mötley Crüe)
-- High-quality PNG output with text shadows
-- Automatic brightness analysis for optimal text contrast
+Press **Update covers** on the Playlists page to refresh covers without regenerating.
 
-#### 📁 Predefined Custom Covers
-Place custom images in your cover directory (stored at `/data/cover`):
-- Exact playlist name matching: `"Top Tracks - Jonas.ext"`
-- Generic fallbacks: `"Top Tracks - all.ext"`
-- Decade-specific covers: `"Back to the 1990s.ext"`
-- Genre-specific covers: `"Jazz Radio.ext"`
+## The web page
 
-#### 🎵 Artist Folder Integration
-JellyJams can use existing cover art from your music library:
-- Searches for `folder.ext`, `cover.ext`, `artist.ext` in artist directories
-- You set the music directory path (in .env) to the same path you set in Jellyfin
-- Case-insensitive artist folder matching
-- Multiple image format support (JPG, PNG, WebP, AVIF, BMP)
+- **Dashboard:** connection, counts, the next run, the last run (how long it took, how many errors), a progress bar while a run is going, and what the next run would change.
+- **Playlists:** what JellyJams made, grouped by kind, then your hand-made ones. Search, view tracks, delete one of its playlists.
+- **Settings:** every setting above. A value that cannot work is refused with the reason, and nothing is saved.
+- **Logs:** filter by level, download.
 
-#### 🔄 Update Covers Feature
-Refresh cover art for existing playlists without regenerating:
-- **Web UI Button**: "Update Covers" on playlists page
-- **Multi-tier Processing**: Tries all cover art sources in priority order
-- **Progress Tracking**: Real-time feedback with statistics
-- **Selective Updates**: Focuses on artist playlists for efficiency
-- **Error Handling**: Graceful fallbacks with detailed logging
+Secrets (the Spotify secret, a Discord webhook) are never sent back to the browser. They show as `********`.
 
-### 🎯 Discovery Playlist Controls
-Fine-tune discovery playlists for better variety:
-- **Max songs per album** (default: 1)
-- **Max songs per artist** (default: 2)
-- Configurable via web UI settings
+To protect the page with a password, set `WEBUI_BASIC_AUTH_ENABLED=true`, `WEBUI_BASIC_AUTH_USERNAME` and `WEBUI_BASIC_AUTH_PASSWORD`. For anything outside your home network, put it behind a reverse proxy as well.
 
-### 🔄 Automatic Library Refresh
-JellyJams automatically triggers a Jellyfin media library scan after playlist creation to ensure playlists appear immediately in your Jellyfin interface. This can be disabled in .env.
+## Monitoring
 
-## 📁 Generated Playlists
+Each run writes its result to `/data/run_status.json`. `GET /api/health` returns it, with status 503 when the last run failed, and the container's `HEALTHCHECK` uses the same file. Any uptime monitor can watch it. A Discord webhook for run summaries is optional (`DISCORD_WEBHOOK_ENABLED`, `DISCORD_WEBHOOK_URL`).
 
-JellyJams creates playlists in the following format:
-
-```
-📁/playlists/
-├── 📁Rock Radio/
-│   └── playlist.xml
-├── 📁Jazz Radio/
-│   └── playlist.xml
-├── 📁Back to the 1970s/
-│   └── playlist.xml
-└── 📁This is The Beatles!/
-    └── playlist.xml
-```
-
-### Playlist XML Format
-
-Playlists are saved in Jellyfin-compatible XML format:
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<playlist xmlns="http://xspf.org/ns/0/">
-  <title>JellyJams Genre: Rock</title>
-  <trackList>
-    <track>
-      <location>file:///path/to/song.mp3</location>
-      <title>Song Title</title>
-      <creator>Artist Name</creator>
-      <album>Album Name</album>
-    </track>
-  </trackList>
-</playlist>
-```
-
-## 🐳 Docker Deployment
-
-### Docker Compose (Recommended)
-
-1. Use the included [docker-compose.yml](docker-compose.yml)
-2. Copy [.env.example](.env.example). to .env
-3. Enter your settings in your .env file
-
-### Unraid Deployment
-
-For Unraid users, bind app data to `/mnt/user/appdata/jellyjams/` for persistent storage. If you are using the included [docker-compose.yml](docker-compose.yml), set these values in your `.env` file.
+## Development
 
 ```bash
-JELLYJAMS_DATA_DIR_HOST=/mnt/user/appdata/jellyjams
-PLAYLIST_DIR_HOST=/mnt/user/appdata/jellyfin/data/playlists
-MUSIC_DIR_HOST=/mnt/user/media/data/music
-MUSIC_DIR_CONTAINER=/mnt/user/media/data/music
+pip install -r requirements-dev.txt
+pytest tests
 ```
 
-## 🔧 API Integration
-
-JellyJams uses the Jellyfin REST API to:
-
-- Fetch music library metadata
-- Parse genres, artists, and years
-- Handle semicolon-separated genre strings
-- Test connection status
-- Retrieve audio item details
-- Retrieve the primary image of artists
-
-## 🎨 Web UI Features
-
-### Dashboard
-- Jellyfin connection status indicator
-- Playlist generation statistics
-- Quick action buttons
-- Real-time status updates
-
-### Settings
-- Jellyfin server configuration
-- Playlist generation options
-- Genre exclusion management
-- Scheduling configuration
-
-### Playlist Management
-- View all generated playlists
-- Filter and search playlists
-- Delete unwanted playlists
-- Preview playlist contents
-
-### Logs (a bit buggy)
-- Real-time log viewing
-- Log filtering and search
-- Download log files
-- Auto-refresh capability
-
-## 🛠️ Development
-
-### Project Structure
-
 ```
-jellyjams/
-├── .env.example           # Environment template
-├── Dockerfile             # Container definition
-├── docker-compose.yml     # Docker Compose config
-└── app/                   # Container app files
-    ├── entrypoint.sh          # App entrypoint
-    ├── start.sh               # App startup script
-    ├── requirements.txt       # Python dependencies
-    ├── vibecodeplugin.py      # Main playlist generator
-    ├── webapp.py              # Flask web UI
-    └── cover                  # Customizable playlist images
-        ├── Playlist Name.jpg
-    └── static/                # WebUI resources
-    └── templates/             # HTML templates
+app/
+  vibecodeplugin.py    the generator (reads Jellyfin, writes playlists)
+  webapp.py            the web page and its API
+  genre_cover.py       draws genre and artist covers
+  cover/               shipped covers
+  templates/ static/   web page
+tests/                 pytest suite
+tools/make_genre_covers.py   how the shipped covers were drawn
 ```
 
-## 🤝 Contributing
+[SETTINGS.md](SETTINGS.md) has more detail on individual settings. It was written for the original project, so where it disagrees with this page, this page is right.
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## License and credits
 
-## 📄 License
+GPL-3.0, see [app/LICENSE](app/LICENSE). Original project by [jonasmore](https://github.com/jonasmore/jellyjams). Built with [Jellyfin](https://jellyfin.org/), [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), [Inter](https://rsms.me/inter/) and [DejaVu Sans](https://dejavu-fonts.github.io/). Cover backgrounds are [Unsplash](https://unsplash.com/license) photos.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Jellyfin](https://jellyfin.org/) - Amazing open-source media server
-- [Bootstrap](https://getbootstrap.com/) - UI framework
-- [Font Awesome](https://fontawesome.com/) - Icons
-- [Inter Font](https://rsms.me/inter/) - Typography
-- [Unsplash](https://unsplash.com/license) - Cover Images
-
-## 📞 Support
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/jonasmore/jellyjams/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/jonasmore/jellyjams/discussions)
-- 🗒️ **Forum Post**: [Jellyfin Forum](https://forum.jellyfin.org/t-jellyjams-automatic-playlist-generator-for-jellyfin-alpha)
+Questions and bugs: [open an issue](https://github.com/didiermortier/JellyJams/issues).
