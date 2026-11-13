@@ -1,9 +1,12 @@
 services:
   jellyjams:
-    image: jonasmore/jellyjams:latest
+    # Built from this repository: docker compose up -d --build
+    build: .
+    image: jellyjams:local
     container_name: jellyjams
     environment:
       # Essential container settings (not configurable via web UI)
+      - TZ=${TZ:-UTC} # Schedule times use this clock
       - JELLYFIN_URL=${JELLYFIN_URL}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
       - ENABLE_WEB_UI=${ENABLE_WEB_UI}
