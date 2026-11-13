@@ -44,11 +44,20 @@
                     <i class="fas fa-cog me-2"></i>Generation Settings
                 </h5>
                 <p class="card-text">
-                    <strong>Interval:</strong> Every {{ settings.generation_interval }} hours
+                    <strong>Schedule:</strong>
+                    {% if settings.schedule_mode == 'weekly' %}
+                        Every {{ settings.schedule_weekday|capitalize }} at {{ settings.schedule_time }}
+                    {% elif settings.schedule_mode == 'daily' %}
+                        Every day at {{ settings.schedule_time }}
+                    {% elif settings.schedule_mode == 'interval' %}
+                        Every {{ settings.generation_interval }} hours
+                    {% else %}
+                        Manual only
+                    {% endif %}
                 </p>
                 <p class="card-text">
                     <strong>Auto Generation:</strong> 
-                    {% if settings.auto_generation %}
+                    {% if settings.schedule_mode in ('weekly', 'daily', 'interval') %}
                         <span class="badge bg-success">Enabled</span>
                     {% else %}
                         <span class="badge bg-secondary">Disabled</span>
@@ -228,7 +237,7 @@ function testConnection() {
 }
 
 function generatePlaylists() {
-    const button = $('button:contains("Generate Now")');
+    const button = $('button[onclick="generatePlaylists()"]');
     const originalText = button.html();
     showSpinner(button);
     

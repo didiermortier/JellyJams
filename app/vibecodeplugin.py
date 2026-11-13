@@ -1638,14 +1638,27 @@ class PlaylistGenerator:
         return self._audio_items_cache
 
     def _playlist_track_ids(self, playlist_id: str, user_id: str) -> List[str]:
-        """Track ids currently in a playlist, used to restore it if a replace fails."""
+        """Track ids currently in a playlist, used to restore it if a replace fails.
+
+        Shared playlists are made without a user id, and Jellyfin refuses to list a
+        playlist without one ("Guid can't be empty"), which silently disabled the
+        restore. Any user can read a shared playlist, so the first user stands in.
+        """
         try:
+            if not user_id:
+                if getattr(self, '_reader_user_id', None) is None:
+                    users = self.jellyfin.get_users()
+                    self._reader_user_id = users[0]['Id'] if users else ''
+                user_id = self._reader_user_id
+            if not user_id:
+                self.logger.warning(f"Cannot read playlist {playlist_id} before replacing it: no Jellyfin user found")
+                return []
             url = f"{self.jellyfin.config.jellyfin_url}/Playlists/{playlist_id}/Items"
             response = self.jellyfin.session.get(url, params={'UserId': user_id})
             response.raise_for_status()
             return [item['Id'] for item in response.json().get('Items', []) if item.get('Id')]
         except Exception as e:
-            self.logger.debug(f"Could not read tracks of playlist {playlist_id}: {e}")
+            self.logger.warning(f"Could not read tracks of playlist {playlist_id} before replacing it: {e}")
             return []
 
     def _remove_playlist_folder(self, jellyfin_path: str):
@@ -3167,16 +3180,32 @@ class PlaylistGenerator:
         self.logger.info("JellyJams playlist generation completed successfully!")
         return {'playlists_created': self.created_playlists, 'playlists_retired': retired}
 
+def parse_args(argv):
+    """Command line of vibecodeplugin.py. An unknown flag is an error, not a silent start:
+    the plain command starts the scheduler and never returns, which is not what a
+    mistyped --dry-run should do."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='vibecodeplugin.py',
+        description='JellyJams playlist generator. With no flags it runs the scheduler.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='read everything, write nothing, and print what a run would do')
+    parser.add_argument('--retire-stale', action='store_true',
+                        help='run once and remove generated playlists that are no longer generated')
+    return parser.parse_args(argv)
+
+
 def main():
     """Main application entry point"""
+    args = parse_args(sys.argv[1:])
     config = Config()
-    dry_run = '--dry-run' in sys.argv[1:]
+    dry_run = args.dry_run
     config.dry_run = dry_run
-    if '--retire-stale' in sys.argv[1:]:
+    if args.retire_stale:
         config.retire_stale_playlists = True
     logger = setup_logging(config)
     
-    if dry_run or '--retire-stale' in sys.argv[1:]:
+    if dry_run or args.retire_stale:
         # One pass, no scheduling. With --dry-run nothing is written. Run it inside the
         # container:
         #   docker exec <container> python /app/vibecodeplugin.py --dry-run
