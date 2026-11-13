@@ -9,6 +9,7 @@ import json
 import logging
 import requests
 from datetime import datetime
+import copy
 from pathlib import Path
 from typing import Dict, List
 from collections import deque
@@ -18,7 +19,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import base64
 import shutil
 from vibecodeplugin import (Config, PlaylistGenerator, JellyfinAPI, setup_logging, SpotifyClient,
-                            DeezerClient, is_generated_playlist_name, load_managed_playlists)
+                            DeezerClient, is_generated_playlist_name, load_managed_playlists,
+                            categorize_playlist)
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -97,6 +99,10 @@ class ConfigManager:
             'min_albums_per_decade': getattr(config, 'min_albums_per_decade', 3),
             'trigger_library_scan': getattr(config, 'trigger_library_scan', True),
             'genre_grouping_enabled': getattr(config, 'genre_grouping_enabled', True),
+            'max_genre_playlists': getattr(config, 'max_genre_playlists', 14),
+            'genre_spotlight_slots': getattr(config, 'genre_spotlight_slots', 2),
+            'max_artist_playlists': getattr(config, 'max_artist_playlists', 20),
+            'max_total_playlists': getattr(config, 'max_total_playlists', 45),
             # Scheduling settings
             'auto_generate_on_startup': getattr(config, 'auto_generate_on_startup', False),
             'schedule_mode': getattr(config, 'schedule_mode', 'weekly'),
@@ -197,6 +203,12 @@ class ConfigManager:
             config.listening_window_days = int(settings.get('listening_window_days', getattr(config, 'listening_window_days', 90)))
         except (TypeError, ValueError):
             pass
+        
+        for key in ('max_genre_playlists', 'genre_spotlight_slots', 'max_artist_playlists', 'max_total_playlists'):
+            try:
+                setattr(config, key, max(0, int(settings.get(key, getattr(config, key)))))
+            except (TypeError, ValueError):
+                pass
         
         # Apply scheduling settings
         config.auto_generate_on_startup = settings.get('auto_generate_on_startup', getattr(config, 'auto_generate_on_startup', False))
@@ -782,6 +794,49 @@ def api_generate_personalized():
         discord_notifier.send_playlist_summary({}, [str(e)])
         
         return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/dry_run', methods=['POST'])
+@requires_auth
+def api_dry_run():
+    """Preview one run: create / replace / skip / retire, without writing anything.
+
+    Runs the generator with dry_run on, in this process, against the live server. The
+    generator refuses every write in that mode, so this is a read-only preview.
+    """
+    try:
+        dry_config = copy.deepcopy(config)
+        dry_config.dry_run = True
+        if request.is_json and request.get_json(silent=True):
+            adopt = request.get_json(silent=True).get('adopt_existing_playlists')
+            if adopt is not None:
+                dry_config.adopt_existing_playlists = bool(adopt)
+        generator = PlaylistGenerator(dry_config, setup_logging(dry_config))
+        generator.generate_playlists()
+        report = generator.dry_run_report()
+        logger.info(f"🔎 Dry run from the web UI: {len(report['plan'])} planned, "
+                    f"{len(report['retire'])} to retire, {len(report['unrecorded_generated'])} unrecorded")
+        return jsonify({'success': True, 'report': report})
+    except Exception as e:
+        logger.error(f"Dry run failed: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/retire_stale', methods=['POST'])
+@requires_auth
+def api_retire_stale():
+    """Remove the generated playlists this run no longer makes (see plan_retirement)."""
+    try:
+        retire_config = copy.deepcopy(config)
+        retire_config.retire_stale_playlists = True
+        generator = PlaylistGenerator(retire_config, setup_logging(retire_config))
+        generator.generate_playlists()
+        logger.info("🧹 Retire-stale run from the web UI finished")
+        return jsonify({'success': True,
+                        'message': 'Retire pass finished; the log shows what was removed'})
+    except Exception as e:
+        logger.error(f"Retire-stale run failed: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/delete_playlist', methods=['POST'])
 @requires_auth
@@ -1435,14 +1490,15 @@ def get_playlist_stats():
     try:
         playlist_dir = Path(config.playlist_folder)
         if not playlist_dir.exists():
-            return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0}
+            return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
         
         stats = {
             'total': 0,
             'genre': 0,
             'year': 0,
             'artist': 0,
-            'personal': 0
+            'personal': 0,
+            'manual': 0
         }
         
         for playlist_path in playlist_dir.iterdir():
@@ -1452,24 +1508,12 @@ def get_playlist_stats():
                     playlist_name = playlist_path.name
                     stats['total'] += 1
                     
-                    # Use same categorization logic as get_detailed_playlist_info
-                    if playlist_name.startswith('This is '):
-                        stats['artist'] += 1
-                    elif playlist_name.startswith('Back to the '):
-                        stats['year'] += 1
-                    elif playlist_name in ['Top Tracks - all', 'Discovery Mix', 'Recent Favorites', 'Genre Mix']:
-                        stats['personal'] += 1
-                    else:
-                        # Check if it's a genre playlist (not starting with special prefixes)
-                        if not any(playlist_name.startswith(prefix) for prefix in ['This is ', 'Back to the ', 'Top Tracks', 'Discovery', 'Recent', 'Genre']):
-                            stats['genre'] += 1
-                        else:
-                            stats['personal'] += 1
+                    stats[categorize_playlist(playlist_name)] += 1
         
         return stats
     except Exception as e:
         logger.error(f"Error getting playlist stats: {e}")
-        return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0}
+        return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
 
 def get_detailed_playlist_info():
     """Get detailed playlist information with proper categorization"""
@@ -1483,7 +1527,8 @@ def get_detailed_playlist_info():
                     'genre': 0,
                     'year': 0,
                     'artist': 0,
-                    'personal': 0
+                    'personal': 0,
+                    'manual': 0
                 }
             }
         
@@ -1493,7 +1538,8 @@ def get_detailed_playlist_info():
             'genre': 0,
             'year': 0,
             'artist': 0,
-            'personal': 0
+            'personal': 0,
+            'manual': 0
         }
         
         for playlist_path in playlist_dir.iterdir():
@@ -1604,27 +1650,10 @@ def get_detailed_playlist_info():
                         # If snapshot logic fails, just omit deltas
                         pass
                     
-                    # Determine playlist category
+                    # Same rules as the dashboard tiles, see categorize_playlist
                     playlist_name = playlist_path.name
-                    category = 'personal'  # Default category
-                    
-                    if playlist_name.startswith('This is '):
-                        category = 'artist'
-                        stats['artist'] += 1
-                    elif playlist_name.startswith('Back to the '):
-                        category = 'year'
-                        stats['year'] += 1
-                    elif playlist_name in ['Top Tracks - all', 'Discovery Mix', 'Recent Favorites', 'Genre Mix']:
-                        category = 'personal'
-                        stats['personal'] += 1
-                    else:
-                        # Check if it's a genre playlist (not starting with special prefixes)
-                        # Genre playlists are typically just the genre name
-                        if not any(playlist_name.startswith(prefix) for prefix in ['This is ', 'Back to the ', 'Top Tracks', 'Discovery', 'Recent', 'Genre']):
-                            category = 'genre'
-                            stats['genre'] += 1
-                        else:
-                            stats['personal'] += 1
+                    category = categorize_playlist(playlist_name)
+                    stats[category] += 1
                     
                     stats['total'] += 1
                     
@@ -1713,4 +1742,4 @@ def get_jellyfin_metadata(jellyfin_api):
 
 if __name__ == '__main__':
     WEB_PORT = int(os.getenv('WEB_PORT', '5000'))
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=True)
+    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)

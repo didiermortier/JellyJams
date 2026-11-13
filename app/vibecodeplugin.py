@@ -22,15 +22,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from io import BytesIO
 
-# PIL/Pillow imports for custom cover art generation
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageEnhance
-    import numpy as np
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+# Pillow is a hard requirement: the genre cover fallback draws with it.
+from PIL import Image
+
+from genre_cover import find_cover, render_genre_cover
 
 # Configuration
+SETTINGS_FILE = '/data/config/settings.json'
+COVER_SOURCE_DIR = '/data/cover'
 
 # --- Name normalization helper ---
 def normalize_name(s: str) -> str:
@@ -70,6 +69,15 @@ class Config:
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         # Media library scan after playlist creation
         self.trigger_library_scan = os.getenv('TRIGGER_LIBRARY_SCAN', 'true').lower() == 'true'
+        # Playlists with a generated-looking name that JellyJams has no record of are left
+        # alone. Set ADOPT_EXISTING_PLAYLISTS=true for one run to take them over.
+        self.adopt_existing_playlists = os.getenv('ADOPT_EXISTING_PLAYLISTS', 'false').lower() == 'true'
+        # Set by `python vibecodeplugin.py --dry-run`: read everything, write nothing.
+        self.dry_run = False
+        # Remove playlists JellyJams made earlier that this run no longer generates (for
+        # example the old per-genre playlists after the caps came in). Off by default;
+        # `python vibecodeplugin.py --retire-stale` turns it on for one pass.
+        self.retire_stale_playlists = os.getenv('RETIRE_STALE_PLAYLISTS', 'false').lower() == 'true'
         
         # Set default values for web UI configurable variables
         self.generation_interval = 24
@@ -121,6 +129,14 @@ class Config:
         self.schedule_weekday = 'sunday'   # weekday name, used by weekly mode
         self.schedule_time = '04:30'       # HH:MM, container local time
         
+        # How many playlists a run may make. The point is quality over quantity: a 10,000
+        # track library otherwise produces well over a hundred genre playlists.
+        self.max_genre_playlists = 14      # the biggest genres, always made
+        self.genre_spotlight_slots = 2     # extra genres from the long tail, rotating weekly
+        self.genre_split_share = 0.25      # a group holding more than this share of the library is split
+        self.max_artist_playlists = 20     # "This is <artist>!", biggest artists first
+        self.max_total_playlists = 45      # genre + decade + artist playlists together
+        
         # Genre grouping/mapping system
         self.genre_grouping_enabled = True
         self.genre_mappings = self._load_genre_mappings()
@@ -130,7 +146,7 @@ class Config:
     
     def load_web_ui_settings(self):
         """Load settings from web UI JSON file - these take precedence over environment variables"""
-        config_file = '/data/config/settings.json'
+        config_file = SETTINGS_FILE
         try:
             if Path(config_file).exists():
                 with open(config_file, 'r') as f:
@@ -199,6 +215,12 @@ class Config:
                     self.trigger_library_scan = bool(web_settings['trigger_library_scan'])
                 if 'genre_grouping_enabled' in web_settings:
                     self.genre_grouping_enabled = bool(web_settings['genre_grouping_enabled'])
+                for key in ('max_genre_playlists', 'genre_spotlight_slots', 'max_artist_playlists',
+                            'max_total_playlists'):
+                    if key in web_settings:
+                        setattr(self, key, max(0, int(web_settings[key])))
+                if 'genre_split_share' in web_settings:
+                    self.genre_split_share = min(1.0, max(0.0, float(web_settings['genre_split_share'])))
                     
                 print(f"🎵  JellyJams web UI settings loaded - overriding environment variables")
                 print(f"   Max tracks: {self.max_tracks_per_playlist}, Min tracks: {self.min_tracks_per_playlist}")
@@ -405,20 +427,23 @@ class Config:
         return normalised
 
     def map_genre_to_group(self, genre):
-        """Map a specific genre to its broader group category"""
+        """Map a specific genre to its broader group category, ignoring case"""
         if not self.genre_grouping_enabled:
             return genre
         
-        # Clean up the genre name
         genre = genre.strip()
         
-        # Search through mappings to find which group this genre belongs to
-        for group_name, genre_list in self.genre_mappings.items():
-            if genre in genre_list:
-                return group_name
+        lookup = getattr(self, '_genre_lookup', None)
+        if lookup is None or getattr(self, '_genre_lookup_source', None) is not self.genre_mappings:
+            lookup = {}
+            for group_name, genre_list in self.genre_mappings.items():
+                for member in genre_list:
+                    lookup.setdefault(member.strip().lower(), group_name)
+            self._genre_lookup = lookup
+            self._genre_lookup_source = self.genre_mappings
         
-        # If no mapping found, return original genre
-        return genre
+        # If no mapping is found the genre stands for itself
+        return lookup.get(genre.lower(), genre)
 
 class SpotifyClient:
     """Spotify API client for downloading cover art"""
@@ -454,8 +479,13 @@ class SpotifyClient:
             return
             
         try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
+            try:
+                import spotipy
+                from spotipy.oauth2 import SpotifyClientCredentials
+            except ImportError:
+                self.logger.warning("Spotify support needs the spotipy package, which this image does not include. "
+                                    "Set SPOTIPY_ENABLED=false or add spotipy to the image.")
+                return
             
             self.logger.info("Initializing Spotify API client...")
             client_credentials_manager = SpotifyClientCredentials(
@@ -744,28 +774,46 @@ def setup_logging(config: Config):
     
     return logger
 
+class DryRunWriteError(RuntimeError):
+    """A write to Jellyfin was attempted during a dry run. Always a bug in the caller."""
+
+
 RUN_STATUS_FILE = '/data/run_status.json'
 MANAGED_PLAYLISTS_FILE = '/data/managed_playlists.json'
+
+
+PERSONAL_PLAYLIST_PREFIXES = ('Top Tracks - ', 'Discovery Mix - ', 'Recent Favorites - ', 'Genre Mix - ')
+
+
+def categorize_playlist(name: str) -> str:
+    """File a playlist name under the kind JellyJams generates, or 'manual'.
+
+    Returns 'genre', 'year', 'artist' or 'personal' for the four name patterns
+    save_playlist is called with: "<genre> Radio", "Back to the <decade>s",
+    "This is <artist>!" and the four personal mixes. Anything else is 'manual', a
+    playlist somebody made by hand. The dashboard counts with this, and
+    is_generated_playlist_name is built on it, so both always agree.
+    """
+    if not name:
+        return 'manual'
+    if name.startswith(PERSONAL_PLAYLIST_PREFIXES):
+        return 'personal'
+    if name.startswith('This is ') and name.endswith('!'):
+        return 'artist'
+    if re.match(r'^Back to the \d+s$', name):
+        return 'year'
+    if name.endswith(' Radio'):
+        return 'genre'
+    return 'manual'
 
 
 def is_generated_playlist_name(name: str) -> bool:
     """True when a name is one JellyJams itself creates.
 
     This is the first guard before anything is deleted, so a playlist made by hand can
-    never be removed even if a generated one wants the same name. The patterns match
-    what save_playlist is called with: "<genre> Radio", "Back to the <decade>s",
-    "This is <artist>!" and the four personal mixes.
+    never be removed even if a generated one wants the same name.
     """
-    if not name:
-        return False
-    if name.endswith(' Radio'):
-        return True
-    if re.match(r'^Back to the \d+s$', name):
-        return True
-    if name.startswith('This is ') and name.endswith('!'):
-        return True
-    return any(name.startswith(prefix) for prefix in
-               ('Top Tracks - ', 'Discovery Mix - ', 'Recent Favorites - ', 'Genre Mix - '))
+    return categorize_playlist(name) != 'manual'
 
 
 def load_managed_playlists() -> Dict[str, str]:
@@ -777,16 +825,6 @@ def load_managed_playlists() -> Dict[str, str]:
     except Exception as e:
         logging.getLogger('jellyjams').warning(f"Could not read the managed playlist list: {e}")
     return {}
-
-
-def playlist_bookkeeping_is_new() -> bool:
-    """True when JellyJams has no record yet of the playlists it created.
-
-    Read once per run, in PlaylistGenerator.__init__, because the record file is written
-    as soon as that run creates its first playlist and every later playlist in the same
-    run still needs to know that the install predates the bookkeeping.
-    """
-    return not Path(MANAGED_PLAYLISTS_FILE).exists()
 
 
 def save_managed_playlists(mapping: Dict[str, str]):
@@ -980,6 +1018,11 @@ class JellyfinAPI:
             'Authorization': f'MediaBrowser Token={config.api_key}',
             'Content-Type': 'application/json'
         })
+
+    def _refuse_write(self, action: str):
+        """Safety net: callers check dry_run first, so reaching this is a bug."""
+        if getattr(self.config, 'dry_run', False):
+            raise DryRunWriteError(f"Refusing to {action} during a dry run")
 
     def get_audio_items(self) -> List[Dict]:
         """Get all audio items from Jellyfin"""
@@ -1244,6 +1287,7 @@ class JellyfinAPI:
 
     def create_playlist(self, name: str, track_ids: List[str], user_id: str = None, is_public: bool = True) -> Dict:
         """Create a playlist using Jellyfin's REST API"""
+        self._refuse_write('create a playlist')
         try:
             # If no user_id provided, get the first available user
             if not user_id:
@@ -1367,6 +1411,7 @@ class JellyfinAPI:
 
     def delete_playlist(self, playlist_id: str) -> bool:
         """Delete a playlist by ID"""
+        self._refuse_write('delete a playlist')
         try:
             url = f"{self.config.jellyfin_url}/Items/{playlist_id}"
             response = self.session.delete(url)
@@ -1381,6 +1426,7 @@ class JellyfinAPI:
 
     def trigger_library_scan(self) -> bool:
         """Trigger a media library scan in Jellyfin to refresh playlists"""
+        self._refuse_write('trigger a library scan')
         try:
             url = f"{self.config.jellyfin_url}/Library/Refresh"
             response = self.session.post(url)
@@ -1393,14 +1439,173 @@ class JellyfinAPI:
             self.logger.error(f"Error triggering library scan: {e}")
             return False
 
+# Spellings that mean the same genre. Keys and values are lower case.
+GENRE_ALIASES = {
+    'electronica': 'electronic',
+    'drum and bass': 'drum & bass',
+    'dnb': 'drum & bass',
+    'hiphop': 'hip hop',
+    'hip-hop': 'hip hop',
+    'rnb': 'r&b',
+    'r and b': 'r&b',
+}
+
+# Genres whose plain title case would look wrong.
+GENRE_DISPLAY = {
+    'r&b': 'R&B', 'edm': 'EDM', 'idm': 'IDM', 'dnb': 'DnB', 'uk garage': 'UK Garage',
+    'drum & bass': 'Drum & Bass', 'hip hop': 'Hip Hop', 'k-pop': 'K-Pop', 'j-pop': 'J-Pop',
+    'lo-fi': 'Lo-Fi', 'ebm': 'EBM',
+}
+
+# Credits that name no real artist, so they never get a "This is ...!" playlist.
+NOT_A_REAL_ARTIST = {'various artists', 'various', 'va', 'unknown artist', 'unknown', '[unknown]', 'soundtrack'}
+
+
+def display_genre(tag: str) -> str:
+    """Playlist-friendly spelling of a genre tag: 'hip hop' -> 'Hip Hop', 'r&b' -> 'R&B'."""
+    tag = (tag or '').strip()
+    key = tag.lower()
+    return GENRE_DISPLAY.get(key) or ' '.join(
+        '-'.join(part[:1].upper() + part[1:] for part in word.split('-')) for word in key.split())
+
+
+def parse_track_genres(item: Dict) -> List[str]:
+    """Genres of one track, split on ';' where a tag holds several, without duplicates."""
+    raw = item.get('Genres') or []
+    if isinstance(raw, str):
+        raw = [raw]
+    seen, genres = set(), []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        for part in entry.split(';'):
+            part = part.strip()
+            if part and part.lower() not in seen:
+                seen.add(part.lower())
+                genres.append(part)
+    return genres
+
+
+def select_genre_playlists(config, audio_items: List[Dict], week: Optional[int] = None) -> List[Dict]:
+    """Decide which genre playlists to make. Pure: reads the config, touches no server.
+
+    Tags are compared without regard to case and aliases are merged, so 'Hip Hop' and
+    'hip hop' are one genre. With grouping on, related tags fold into their group
+    (Rock, Pop, Hip Hop ...). A group that holds more than genre_split_share of the whole
+    library is too broad to be one playlist, so its members stand on their own instead:
+    that is what turns a house-heavy library into House, Progressive House, Deep House
+    and so on rather than one giant Electronic.
+
+    The biggest max_genre_playlists genres are always made. genre_spotlight_slots more
+    are taken from the rest and rotate with the ISO week number, so the long tail still
+    gets its turn. Returns [{'genre', 'tracks', 'artists', 'kind'}], best first.
+    """
+    excluded = {g.strip().lower() for g in (config.excluded_genres or []) if g and g.strip()}
+    excluded_artists = set(config.excluded_artists or [])
+    grouping = bool(config.genre_grouping_enabled)
+
+    tag_tracks: Dict[str, Dict[str, Dict]] = {}
+    tag_names: Dict[str, str] = {}
+    all_tracks = set()
+    for item in audio_items:
+        if excluded_artists and any(a in excluded_artists for a in (item.get('Artists') or [])):
+            continue
+        track_id = item.get('Id')
+        if not track_id:
+            continue
+        for tag in parse_track_genres(item):
+            key = GENRE_ALIASES.get(tag.lower(), tag.lower())
+            if key in excluded or tag.lower() in excluded:
+                continue
+            tag_tracks.setdefault(key, {})[track_id] = item
+            tag_names.setdefault(key, tag)
+            all_tracks.add(track_id)
+
+    def group_key(key: str) -> str:
+        return config.map_genre_to_group(key).lower() if grouping else key
+
+    groups: Dict[str, List[str]] = {}
+    for key in tag_tracks:
+        groups.setdefault(group_key(key), []).append(key)
+
+    group_labels = {name.lower(): name for name in (config.genre_mappings or {})}
+    candidates: Dict[str, Dict] = {}
+
+    def add(label_key: str, label: str, pool: Dict[str, Dict]):
+        entry = candidates.setdefault(label_key, {'genre': label, 'pool': {}})
+        entry['pool'].update(pool)
+
+    for gkey, members in groups.items():
+        pool: Dict[str, Dict] = {}
+        for key in members:
+            pool.update(tag_tracks[key])
+        too_broad = (grouping and len(members) > 1 and all_tracks
+                     and len(pool) > config.genre_split_share * len(all_tracks))
+        if too_broad:
+            for key in members:
+                add(key, display_genre(key), tag_tracks[key])
+        else:
+            add(gkey, group_labels.get(gkey) or display_genre(gkey), pool)
+
+    qualifying = []
+    for entry in candidates.values():
+        tracks = list(entry['pool'].values())
+        artists = {a for t in tracks for a in (t.get('Artists') or [])}
+        if len(tracks) >= config.min_tracks_per_playlist and len(artists) >= config.min_artist_diversity:
+            qualifying.append({'genre': entry['genre'], 'tracks': tracks, 'artists': len(artists)})
+
+    qualifying.sort(key=lambda c: (-len(c['tracks']), -c['artists'], c['genre'].lower()))
+    top = qualifying[:config.max_genre_playlists]
+    for entry in top:
+        entry['kind'] = 'top'
+
+    # A spotlight is a treat, not filler: the long tail only qualifies when it holds enough
+    # tracks to make a playlist worth opening.
+    spotlight_min = config.min_tracks_per_playlist * 5
+    rest = sorted((c for c in qualifying[config.max_genre_playlists:] if len(c['tracks']) >= spotlight_min),
+                  key=lambda c: c['genre'].lower())
+    slots = min(config.genre_spotlight_slots, len(rest))
+    spotlight = []
+    if slots > 0:
+        if week is None:
+            week = datetime.now().isocalendar()[1]
+        start = (week * slots) % len(rest)
+        spotlight = [rest[(start + i) % len(rest)] for i in range(slots)]
+        for entry in spotlight:
+            entry['kind'] = 'spotlight'
+    return top + spotlight
+
+
+def select_artist_playlists(config, artist_data: Dict[str, Dict], limit: int) -> List[str]:
+    """The artists that get a "This is <artist>!" playlist: biggest first, at most `limit`.
+
+    artist_data maps an artist to {'tracks': [...], 'albums': set(...)}.
+    """
+    excluded = set(config.excluded_artists or [])
+    eligible = []
+    for artist, data in artist_data.items():
+        if artist in excluded or artist.strip().lower() in NOT_A_REAL_ARTIST:
+            continue
+        if len(data['tracks']) < config.min_tracks_per_playlist:
+            continue
+        if len(data['albums']) < config.min_albums_per_artist:
+            continue
+        eligible.append(artist)
+    eligible.sort(key=lambda a: (-len(artist_data[a]['tracks']), -len(artist_data[a]['albums']), a.lower()))
+    return eligible[:max(0, limit)]
+
+
 class PlaylistGenerator:
     def __init__(self, config: Config, logger):
         self.config = config
         self.logger = logger
-        # Decided once per run, before this run creates anything: the record file is
-        # written as soon as the first playlist is created, and every later playlist in
-        # the same run still has to know whether the install predates the bookkeeping.
-        self.bookkeeping_is_new = playlist_bookkeeping_is_new()
+        # What a dry run found: one entry per playlist this run would create, replace
+        # or skip. Stays empty on a normal run.
+        self.dry_run_plan: List[Dict] = []
+        # Genre, decade and artist playlists chosen so far this run, for max_total_playlists
+        self.shared_planned = 0
+        # Every playlist name this run set out to make, whether or not the create worked
+        self.planned_names = set()
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
@@ -1467,14 +1672,15 @@ class PlaylistGenerator:
             self.logger.debug(f"Could not remove playlist folder {jellyfin_path}: {e}")
 
     def adopt_existing_playlists(self) -> int:
-        """Record the playlists JellyJams created before it kept a record.
+        """Take over playlists that carry a generated name but are not in the record.
 
-        Runs once, only while the record is new. It adopts every existing playlist whose
-        name is one JellyJams generates, so an install that predates the bookkeeping
-        keeps updating itself, including names this run does not happen to generate.
-        Nothing else is adopted, so a hand-made playlist is never claimed.
+        Off unless ADOPT_EXISTING_PLAYLISTS=true. A name is no proof that JellyJams made
+        a playlist, so nothing is claimed by default: a playlist that is not in
+        managed_playlists.json is left alone. Turn it on for one run when upgrading from
+        a version that kept no record. Only generated names are adopted, so a hand-made
+        playlist is never claimed, and every adoption is logged.
         """
-        if not self.bookkeeping_is_new:
+        if not self.config.adopt_existing_playlists or self.config.dry_run:
             return 0
 
         managed = load_managed_playlists()
@@ -1484,23 +1690,131 @@ class PlaylistGenerator:
             if name and is_generated_playlist_name(name) and managed.get(name) != item.get('Id'):
                 managed[name] = item.get('Id')
                 adopted += 1
+                self.logger.info(f"📋 Adopted existing playlist '{name}' (id {item.get('Id')})")
 
         if adopted:
             save_managed_playlists(managed)
-            self.logger.info(
-                f"📋 Adopted {adopted} playlist(s) that JellyJams created before it kept a record"
-            )
+            self.logger.info(f"📋 Adopted {adopted} playlist(s). Turn ADOPT_EXISTING_PLAYLISTS off again.")
         return adopted
+
+    def _record(self) -> Dict[str, str]:
+        """The managed-playlist record as this run sees it.
+
+        In a dry run with ADOPT_EXISTING_PLAYLISTS on, the adoption that a real run would
+        do is shown as already done, so the preview matches what the real run does.
+        """
+        managed = load_managed_playlists()
+        if self.config.dry_run and self.config.adopt_existing_playlists:
+            for item in self.jellyfin.list_playlists():
+                name = item.get('Name')
+                if name and is_generated_playlist_name(name) and name not in managed:
+                    managed[name] = item.get('Id')
+        return managed
+
+    def _classify_existing(self, name: str, user_id: str):
+        """Split the playlists called `name` into (ours, foreign). Reads only.
+
+        Ours means the playlist id is the one JellyJams recorded when it created it.
+        Everything else with that name, including a hand-made playlist, is foreign.
+        """
+        managed = self._record()
+        ours, foreign = [], []
+        for item in self.jellyfin.find_playlists_by_name(name, user_id):
+            (ours if managed.get(name) == item.get('Id') else foreign).append(item)
+        return ours, foreign
+
+    def dry_run_report(self) -> Dict:
+        """What a dry run would do, plus generated-looking playlists it will not touch."""
+        managed_ids = set(self._record().values())
+        unrecorded = sorted(
+            item.get('Name') for item in self.jellyfin.list_playlists()
+            if is_generated_playlist_name(item.get('Name', '')) and item.get('Id') not in managed_ids
+        )
+        return {'plan': list(self.dry_run_plan), 'unrecorded_generated': unrecorded,
+                'retire': self.plan_retirement()}
+
+    # The playlist kinds a run can retire, and the playlist type setting that makes them.
+    RETIRABLE_TYPES = {'genre': 'Genre', 'year': 'Year', 'artist': 'Artist'}
+
+    def plan_retirement(self) -> List[Dict]:
+        """Playlists JellyJams made earlier that this run no longer generates. Reads only.
+
+        A playlist is on the list only when all of these hold: its id is in the record,
+        its name is a generated one, it is a genre, decade or artist playlist whose type
+        is switched on for this run (a type you turned off is not touched), this run did
+        not plan to make it, and Jellyfin still shows that id under that very name (a
+        playlist you renamed since is yours now). Personal mixes are never retired.
+        """
+        enabled = set(self.config.playlist_types or [])
+        # A kind this run made nothing of (a library that lost its tags, a cap of zero) is
+        # never wiped: that looks like a broken run, not a wish to delete everything.
+        made = {categorize_playlist(n) for n in self.planned_names}
+        record = self._record()
+        by_id = {item.get('Id'): item for item in self.jellyfin.list_playlists()}
+        stale = []
+        for name, playlist_id in sorted(record.items()):
+            kind = categorize_playlist(name)
+            if (self.RETIRABLE_TYPES.get(kind) not in enabled or kind not in made
+                    or normalize_name(name) in self.planned_names):
+                continue
+            item = by_id.get(playlist_id)
+            if not item or normalize_name(item.get('Name', '')) != normalize_name(name):
+                continue
+            stale.append({'name': name, 'id': playlist_id, 'kind': kind, 'path': item.get('Path')})
+        return stale
+
+    def retire_stale_playlists(self) -> int:
+        """Delete the playlists plan_retirement lists, and forget them in the record."""
+        if self.config.dry_run:
+            return 0
+        retired = 0
+        managed = load_managed_playlists()
+        for entry in self.plan_retirement():
+            if not is_generated_playlist_name(entry['name']):      # belt and braces
+                continue
+            if self.jellyfin.delete_playlist(entry['id']):
+                self._remove_playlist_folder(entry.get('path'))
+                managed.pop(entry['name'], None)
+                retired += 1
+                self.logger.info(f"🧹 Retired '{entry['name']}' (id {entry['id']}): no longer generated")
+            else:
+                self.logger.warning(f"⚠️ Could not retire '{entry['name']}' (id {entry['id']})")
+        if retired:
+            save_managed_playlists(managed)
+        return retired
+
+    def _log_dry_run_report(self):
+        report = self.dry_run_report()
+        by_action: Dict[str, List[Dict]] = {'create': [], 'replace': [], 'skip': []}
+        for entry in report['plan']:
+            by_action[entry['action']].append(entry)
+
+        lines = ["", "================ JellyJams DRY RUN: nothing was changed ================"]
+        for action, label in (('create', 'Would CREATE'), ('replace', 'Would REPLACE (created by JellyJams)'),
+                              ('skip', 'Would SKIP (a playlist of that name exists that JellyJams did not create)')):
+            entries = by_action[action]
+            lines.append(f"{label}: {len(entries)}")
+            lines.extend(f"    {e['name']}  [{e['type']}, {e['tracks']} tracks]" for e in entries)
+        retire = report['retire']
+        lines.append(f"Would RETIRE (made by JellyJams, no longer generated): {len(retire)}")
+        lines.extend(f"    {e['name']}" for e in retire)
+        if retire:
+            lines.append("    (removed only by a real run with --retire-stale or RETIRE_STALE_PLAYLISTS=true)")
+        unrecorded = report['unrecorded_generated']
+        lines.append(f"Generated-looking playlists JellyJams has no record of, left alone: {len(unrecorded)}")
+        lines.extend(f"    {name}" for name in unrecorded)
+        if unrecorded:
+            lines.append("    (set ADOPT_EXISTING_PLAYLISTS=true for one run to take these over)")
+        lines.append("========================================================================")
+        for line in lines:
+            self.logger.info(line)
 
     def _remove_existing_playlists(self, name: str, user_id: str):
         """Remove our own playlist with this name and its folder.
 
-        Returns (rollback_track_ids, skip). Only playlists JellyJams created are removed:
-        one made by hand is left alone even when it shares a name with a generated one,
-        and the replacement is skipped rather than left as a duplicate. On the very first
-        run, generated names already present are adopted once, which is what lets an
-        install that predates this bookkeeping keep updating itself, and every adopted
-        name is logged.
+        Returns (rollback_track_ids, skip). Only a playlist whose id JellyJams recorded
+        is removed. One made by hand is left alone even when it shares a name with a
+        generated one, and the replacement is skipped rather than left as a duplicate.
 
         Jellyfin derives the playlist folder from the name and appends a number when that
         name is taken, so the name has to be freed before the create or it lands in
@@ -1512,35 +1826,22 @@ class PlaylistGenerator:
             self.logger.warning(f"Refusing to manage '{name}': JellyJams does not generate that name")
             return [], True
 
-        existing = self.jellyfin.find_playlists_by_name(name, user_id)
-        if not existing:
-            self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
-            return [], False
-
-        managed = load_managed_playlists()
-        first_run = self.bookkeeping_is_new
-
-        ours, foreign = [], []
-        for item in existing:
-            if managed.get(name) == item.get('Id') or first_run:
-                ours.append(item)
-            else:
-                foreign.append(item)
+        ours, foreign = self._classify_existing(name, user_id)
 
         if foreign:
             self.logger.warning(
-                f"⚠️ A playlist named '{name}' exists but was not created by JellyJams. "
-                f"Leaving it untouched and skipping that name. Rename or remove it if "
-                f"JellyJams should manage it again."
+                f"⚠️ A playlist named '{name}' exists but was not created by JellyJams "
+                f"(it is not in the record). Leaving it untouched and skipping that name. "
+                f"Rename or remove it if JellyJams should manage the name again, or set "
+                f"ADOPT_EXISTING_PLAYLISTS=true for one run."
             )
             return [], True
 
+        if not ours:
+            self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
+            return [], False
+
         self.logger.info(f"Found {len(ours)} existing playlist(s) named '{name}'")
-        if first_run:
-            self.logger.info(
-                f"📋 First run with playlist bookkeeping: adopting '{name}' "
-                f"(and the other names JellyJams generates) as managed"
-            )
 
         rollback_tracks: List[str] = []
         for item in ours:
@@ -1581,7 +1882,7 @@ class PlaylistGenerator:
     def copy_custom_cover_art(self, playlist_name: str, playlist_dir: Path) -> bool:
         """Copy custom cover art from /app/cover/ directory with fallback system and extension preservation"""
         try:
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             self.logger.info(f"Looking for custom cover art for playlist: {playlist_name}")
             self.logger.info(f"Checking cover source directory: {cover_source_dir}")
             
@@ -1691,7 +1992,7 @@ class PlaylistGenerator:
             decade = playlist_name.replace("Back to the ", "").strip()
             self.logger.info(f"🗓️ Looking for decade-specific cover art for: {decade}")
             
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             
             if not cover_source_dir.exists():
                 self.logger.warning(f"Cover source directory does not exist: {cover_source_dir}")
@@ -1761,23 +2062,18 @@ class PlaylistGenerator:
         try:
             self.logger.info(f"🎵 Looking for genre cover art for: {genre_name}")
             
-            cover_source_dir = Path("/data/cover")
+            cover_source_dir = Path(COVER_SOURCE_DIR)
             
             if not cover_source_dir.exists():
                 self.logger.warning(f"Cover source directory does not exist: {cover_source_dir}")
                 return False
             
-            # First, try to find predefined genre cover art
-            names = [f"{genre_name} Radio", genre_name]
+            # First, try to find predefined genre cover art. Case does not matter: genre
+            # names come from the library's tags, and file names on Linux are case sensitive.
             exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.avif']
-            source_image = None
-            for base in names:
-                for ext in exts:
-                    potential_file = cover_source_dir / f"{base}{ext}"
-                    if potential_file.exists() and potential_file.is_file():
-                        source_image = potential_file
-                        self.logger.info(f"🖼️ Found predefined genre cover art: {source_image}")
-                        break
+            source_image = find_cover(cover_source_dir, [f"{genre_name} Radio", genre_name])
+            if source_image:
+                self.logger.info(f"🖼️ Found predefined genre cover art: {source_image}")
             
             # If predefined cover found, copy it directly
             if source_image:
@@ -1832,93 +2128,13 @@ class PlaylistGenerator:
             return False
     
     def _generate_genre_cover_art(self, background_path: Path, genre_name: str, destination: Path) -> bool:
-        """Generate genre cover art with centered text overlay on background template"""
+        """Draw a cover for a genre that has none shipped: see genre_cover.render_genre_cover"""
         try:
-            from PIL import Image, ImageDraw, ImageFont
-            
-            self.logger.info(f"🎨 Generating genre cover art: {genre_name} on {background_path}")
-            
-            # Open and resize background image to standard size
-            with Image.open(background_path) as background:
-                # Convert to RGB if necessary
-                if background.mode != 'RGB':
-                    background = background.convert('RGB')
-                
-                # Resize to standard cover art size
-                cover_size = (600, 600)
-                background = background.resize(cover_size, Image.Resampling.LANCZOS)
-                
-                # Create drawing context
-                draw = ImageDraw.Draw(background)
-                
-                # Try to load a bold font, fallback to default
-                try:
-                    # Try to find a system font
-                    font_size = 400  # 5x bigger than original 80
-                    font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", font_size)
-                except:
-                    try:
-                        # Alternative system font paths
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                    except:
-                        # Fallback to default font
-                        font = ImageFont.load_default()
-                        self.logger.warning("Using default font for genre cover art")
-                
-                # Prepare text lines
-                line1 = genre_name.upper()
-                line2 = "RADIO"
-                
-                # Get text dimensions for centering
-                bbox1 = draw.textbbox((0, 0), line1, font=font)
-                bbox2 = draw.textbbox((0, 0), line2, font=font)
-                
-                text1_width = bbox1[2] - bbox1[0]
-                text1_height = bbox1[3] - bbox1[1]
-                text2_width = bbox2[2] - bbox2[0]
-                text2_height = bbox2[3] - bbox2[1]
-                
-                # Calculate centered positions
-                img_width, img_height = cover_size
-                
-                # Position text in center with some spacing between lines
-                line_spacing = 20
-                total_text_height = text1_height + text2_height + line_spacing
-                
-                y_start = (img_height - total_text_height) // 2
-                
-                x1 = (img_width - text1_width) // 2
-                y1 = y_start
-                
-                x2 = (img_width - text2_width) // 2
-                y2 = y_start + text1_height + line_spacing
-                
-                # Draw text with white color and black outline for visibility
-                outline_width = 3
-                text_color = "white"
-                outline_color = "black"
-                
-                # Draw outline by drawing text in multiple positions
-                for adj_x in range(-outline_width, outline_width + 1):
-                    for adj_y in range(-outline_width, outline_width + 1):
-                        if adj_x != 0 or adj_y != 0:
-                            draw.text((x1 + adj_x, y1 + adj_y), line1, font=font, fill=outline_color)
-                            draw.text((x2 + adj_x, y2 + adj_y), line2, font=font, fill=outline_color)
-                
-                # Draw main text
-                draw.text((x1, y1), line1, font=font, fill=text_color)
-                draw.text((x2, y2), line2, font=font, fill=text_color)
-                
-                # Save the final image
-                background.save(destination, "JPEG", quality=85)
-                
-                self.logger.info(f"✅ Generated genre cover art: {destination}")
-                return True
-                
+            render_genre_cover(background_path, genre_name, destination)
+            self.logger.info(f"✅ Generated genre cover art: {destination}")
+            return True
         except Exception as e:
-            self.logger.error(f"Error generating genre cover art: {e}")
-            import traceback
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(f"Error generating genre cover art for {genre_name}: {e}")
             return False
     
     def _try_artist_folder_fallback(self, playlist_name: str, playlist_dir: Path) -> bool:
@@ -2082,204 +2298,31 @@ class PlaylistGenerator:
             return ''.join(char for char in text if ord(char) < 128)
     
     def _generate_custom_cover_art(self, source_image: bytes, artist_name: str, destination: Path) -> bool:
-        """Generate custom cover art with 'This is <artist>' text overlay using multi-stage scaling approach"""
-        try:
-            import signal
-            import time
-            
-            start_time = time.time()
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Cover art generation timed out")
-            
-            # Set timeout to prevent worker crashes - reduced to 10 seconds for faster processing
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)  # 10 second timeout
-            
-            # Open the source image
-            with Image.open(BytesIO(source_image)) as img:
-                # Convert to RGB if needed
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # Create a copy to work with
-                cover_img = img.copy()
-                
-                # Resize to smaller cover art size (350x350) for better text proportion
-                cover_img.thumbnail((350, 350), Image.Resampling.LANCZOS)
-                
-                # Create a new 350x350 image with the resized image centered
-                final_img = Image.new('RGB', (350, 350), (0, 0, 0))
-                
-                # Calculate position to center the image
-                x = (350 - cover_img.width) // 2
-                y = (350 - cover_img.height) // 2
-                final_img.paste(cover_img, (x, y))
-                
-                # Create drawing context
-                draw = ImageDraw.Draw(final_img)
-                
-                # Use extremely massive font size - 4x bigger again as requested (960pt)
-                font_size = 960  # Extremely massive font size for 350x350 canvas to match reference
-                font = None
-                
-                # Use a completely different approach - create large text by scaling
-                # Start with a reasonable font size that we know works, then scale the image
-                base_font_size = 80  # Use a size we know renders properly
-                font = None
-                
-                # Try to load a system font at base size
-                try:
-                    # Try to find a system font
-                    system_fonts = [
-                        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',  # Linux
-                        '/System/Library/Fonts/Helvetica.ttc',  # macOS
-                        'arial.ttf',  # Windows fallback
-                    ]
-                    
-                    for font_path in system_fonts:
-                        try:
-                            font = ImageFont.truetype(font_path, base_font_size)
-                            self.logger.debug(f"Using system font: {font_path} at {base_font_size}pt")
-                            break
-                        except:
-                            continue
-                            
-                except Exception as font_e:
-                    self.logger.warning(f"Could not load system fonts: {font_e}")
-                
-                # If no system font, try default
-                if font is None:
-                    try:
-                        font = ImageFont.load_default()
-                        self.logger.debug(f"Using default font at base size")
-                    except Exception:
-                        self.logger.error("Could not load any font")
-                        return False
-                
-                
-                # Determine text color based on background brightness
-                text_color = self._get_adaptive_text_color(final_img)
-                
-                # Define the text lines for "This is [Artist]" overlay
-                line1 = "This is"
-                # Sanitize artist name to handle Unicode characters that fonts can't render
-                line2 = self._sanitize_text_for_font(artist_name)
-                
-                # Calculate text dimensions on large canvas
-                if font:
-                    bbox1 = draw.textbbox((0, 0), line1, font=font)
-                    bbox2 = draw.textbbox((0, 0), line2, font=font)
-                    
-                    line1_width = bbox1[2] - bbox1[0]
-                    line1_height = bbox1[3] - bbox1[1]
-                    line2_width = bbox2[2] - bbox2[0]
-                    line2_height = bbox2[3] - bbox2[1]
-                    
-                    max_width = max(line1_width, line2_width)
-                    total_height = line1_height + line2_height + 5  # Minimum spacing between lines
-                else:
-                    # Fallback estimates
-                    line1_height = 80
-                    line2_height = 80
-                    total_height = 200
-                    max_width = 600
-                
-                # Create a large text canvas for high-quality text rendering
-                text_canvas_size = 1000  # Large canvas for high-quality text
-                text_img = Image.new('RGBA', (text_canvas_size, text_canvas_size), (0, 0, 0, 0))
-                text_draw = ImageDraw.Draw(text_img)
-                
-                # Position text on large canvas (centered for now, we'll position the final result)
-                text_x = 50  # Left margin on large canvas
-                start_y = (text_canvas_size - total_height) // 2
-                
-                line1_y = start_y
-                line2_y = start_y + line1_height + 5  # Minimum spacing between lines
-                
-                # Draw text on large canvas
-                text_draw.text((text_x, line1_y), line1, fill=text_color, font=font)
-                text_draw.text((text_x, line2_y), line2, fill=text_color, font=font)
-                
-                # Crop the text area to remove excess transparent space
-                bbox = text_img.getbbox()
-                if bbox:
-                    text_img = text_img.crop(bbox)
-                
-                # Scale the text to be much larger - this is where we get the massive size
-                scale_factor = 3.0  # Make text 3x larger
-                new_width = int(text_img.width * scale_factor)
-                new_height = int(text_img.height * scale_factor)
-                text_img = text_img.resize((new_width, new_height), Image.LANCZOS)
-                
-                # Position the scaled text on the final image (bottom left)
-                paste_x = 20  # Left margin
-                paste_y = 350 - new_height - 30  # Bottom alignment with margin
-                
-                # Ensure text fits within image bounds
-                if paste_y < 0:
-                    paste_y = 10
-                if paste_x + new_width > 350:
-                    # Scale down if too wide
-                    scale_factor = (350 - 40) / text_img.width
-                    new_width = int(text_img.width * scale_factor)
-                    new_height = int(text_img.height * scale_factor)
-                    text_img = text_img.resize((new_width, new_height), Image.LANCZOS)
-                    paste_y = 350 - new_height - 30
-                
-                # Paste the text onto the final image
-                final_img.paste(text_img, (paste_x, paste_y), text_img)
-                
-                # Save the final image as PNG
-                final_img.save(destination, 'webp')
-                
-                # Clear timeout
-                signal.alarm(0)
-                
-                self.logger.info(f" Generated custom cover art with text overlay: {line1} {line2}")
-                return True
-                
-        except ImportError:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error("❌ Pillow library not available. Install with: pip install Pillow")
-            return False
-        except TimeoutError:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error("❌ Cover art generation timed out after 30 seconds")
-            return False
-        except Exception as e:
-            signal.alarm(0)  # Clear timeout
-            self.logger.error(f"❌ Error generating custom cover art: {e}")
-            import traceback
-            self.logger.debug(f"Full traceback: {traceback.format_exc()}")
-            return False
-    
-    def _get_adaptive_text_color(self, image: 'Image') -> tuple:
-        """Determine text color (black or white) based on background brightness"""
-        try:
-            # Sample the bottom area where text will be placed
-            bottom_area = image.crop((0, 480, 600, 600))  # Bottom 120px
-            
-            # Calculate average brightness
-            import numpy as np
-            img_array = np.array(bottom_area)
-            
-            # Calculate luminance using standard formula
-            luminance = np.mean(img_array[:, :, 0] * 0.299 + 
-                              img_array[:, :, 1] * 0.587 + 
-                              img_array[:, :, 2] * 0.114)
-            
-            # Return white text for dark backgrounds, black for light backgrounds
-            if luminance < 128:
-                return (255, 255, 255)  # White text
-            else:
-                return (0, 0, 0)  # Black text
-                
-        except Exception as e:
-            self.logger.debug(f"Error calculating adaptive text color: {e}")
-            # Default to white text with shadow
-            return (255, 255, 255)
+        """Artist cover: the artist's photo in the artist's own colour, name on top.
 
+        Same treatment as the genre covers (see genre_cover.render_genre_cover), drawn with
+        the bundled font. Replaces the old renderer, which looked for system fonts the
+        Alpine image does not ship and computed a font size for a canvas twice as large.
+        """
+        tmp_bg = Path(str(destination) + '.bg.jpg')
+        tmp_out = destination.with_suffix(destination.suffix + '.tmp' + destination.suffix)
+        try:
+            with Image.open(BytesIO(source_image)) as source:
+                source.convert('RGB').save(tmp_bg, 'JPEG', quality=90)
+            render_genre_cover(tmp_bg, artist_name, tmp_out)
+            os.replace(tmp_out, destination)
+            self.logger.info(f"✅ Generated artist cover art: {destination}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error generating artist cover art for {artist_name}: {e}")
+            return False
+        finally:
+            for junk in (tmp_bg, tmp_out):
+                try:
+                    junk.unlink()
+                except OSError:
+                    pass
+    
     def _apply_discovery_diversity_controls(self, tracks: List[Dict]) -> List[Dict]:
         """Apply diversity controls to discovery playlist: limit songs per album and per artist"""
         try:
@@ -2351,7 +2394,7 @@ class PlaylistGenerator:
         return sanitized
     
     def _jellyfin_playlist_dir(self, playlist_name: str) -> str:
-        """
+        r"""
         Replace invalid filename characters with spaces as Jellyfin does so that
         the playlist and corresponding image are saved in the same directory.
           - Characters: \ / : * ? " < > | and ASCII control chars (0–31)
@@ -2367,6 +2410,8 @@ class PlaylistGenerator:
         self.logger.info(f"=== STARTING PLAYLIST CREATION ===")
         self.logger.info(f"Playlist Type: {playlist_type}")
         self.logger.info(f"Original Playlist Name: {repr(name)}")
+        
+        self.planned_names.add(normalize_name(name))
         
         # Sanitize the playlist name to prevent filesystem errors
         sanitized_name = self._sanitize_playlist_name(name)
@@ -2402,6 +2447,18 @@ class PlaylistGenerator:
             
             self.logger.info(f"Creating {privacy_text} {playlist_type} playlist: {sanitized_name} with {len(track_ids)} tracks")
             
+            if self.config.dry_run:
+                api_name = normalize_name(name)
+                if not is_generated_playlist_name(api_name):
+                    action = 'skip'
+                else:
+                    ours, foreign = self._classify_existing(api_name, user_id)
+                    action = 'skip' if foreign else ('replace' if ours else 'create')
+                self.dry_run_plan.append({'name': api_name, 'type': playlist_type,
+                                          'action': action, 'tracks': len(track_ids)})
+                self.logger.info(f"🔎 DRY RUN: would {action} '{api_name}' ({len(track_ids)} tracks)")
+                return None
+
             # Jellyfin names each playlist's folder after the playlist and appends a
             # number when that name is taken, so creating a second copy before removing
             # the first gives you "House Radio" and "House Radio1". The folder also
@@ -2569,82 +2626,28 @@ class PlaylistGenerator:
             return None
 
     def generate_genre_playlists(self, audio_items: List[Dict]):
-        """Generate playlists by genre with genre grouping/mapping support"""
+        """Generate the genre playlists: the biggest genres plus a few rotating spotlights"""
         self.logger.info("🎵 Generating genre-based playlists...")
+        self.logger.info(
+            f"🔧 Up to {self.config.max_genre_playlists} genres plus {self.config.genre_spotlight_slots} "
+            f"spotlight(s), grouping {'on' if self.config.genre_grouping_enabled else 'off'}"
+        )
         
-        if self.config.genre_grouping_enabled:
-            self.logger.info(f"🔄 Genre grouping enabled - consolidating {len(self.config.genre_mappings)} genre groups")
-        else:
-            self.logger.info("📋 Genre grouping disabled - using individual genres")
+        selected = select_genre_playlists(self.config, audio_items)
+        room = max(0, self.config.max_total_playlists - self.shared_planned)
+        if len(selected) > room:
+            self.logger.info(f"Total playlist cap ({self.config.max_total_playlists}): keeping {room} of {len(selected)} genres")
+            selected = selected[:room]
         
-        # Group tracks by genre (with optional mapping to consolidated groups)
-        genre_tracks = {}
-        original_genre_stats = {}  # Track original genre distribution for logging
-        
-        for item in audio_items:
-            if not item.get('Genres'):
-                continue
-            
-            # Check if any artist in this track is excluded
-            if self.config.excluded_artists and item.get('Artists'):
-                excluded_artist_found = False
-                for artist in item['Artists']:
-                    if artist in self.config.excluded_artists:
-                        excluded_artist_found = True
-                        break
-                if excluded_artist_found:
-                    continue
-            
-            # Parse genres - handle both list and semicolon-separated string formats
-            genres = []
-            if isinstance(item['Genres'], list):
-                for genre_item in item['Genres']:
-                    if isinstance(genre_item, str) and ';' in genre_item:
-                        # Split semicolon-separated genres
-                        genres.extend([g.strip() for g in genre_item.split(';') if g.strip()])
-                    elif isinstance(genre_item, str):
-                        genres.append(genre_item.strip())
-            elif isinstance(item['Genres'], str):
-                if ';' in item['Genres']:
-                    genres = [g.strip() for g in item['Genres'].split(';') if g.strip()]
-                else:
-                    genres = [item['Genres'].strip()]
-            
-            # Add track to each genre it belongs to (with optional mapping)
-            for original_genre in genres:
-                if original_genre and original_genre not in self.config.excluded_genres:
-                    # Track original genre stats
-                    original_genre_stats[original_genre] = original_genre_stats.get(original_genre, 0) + 1
-                    
-                    # Map to consolidated genre group if grouping is enabled
-                    final_genre = self.config.map_genre_to_group(original_genre)
-                    
-                    if final_genre not in genre_tracks:
-                        genre_tracks[final_genre] = []
-                    genre_tracks[final_genre].append(item)
-        
-        # Create playlists for each genre
-        for genre, tracks in genre_tracks.items():
-            if len(tracks) < self.config.min_tracks_per_playlist:
-                continue
-            
-            # Check artist diversity - count unique artists in this genre
-            unique_artists = set()
-            for track in tracks:
-                if track.get('Artists'):
-                    for artist in track['Artists']:
-                        unique_artists.add(artist)
-            
-            if len(unique_artists) < self.config.min_artist_diversity:
-                self.logger.info(f"Skipping genre '{genre}' - only {len(unique_artists)} artists (minimum: {self.config.min_artist_diversity})")
-                continue
-                
-            # Pick a random sample of the pool (see _select_tracks)
-            limited_tracks = self._select_tracks(tracks)
-            
-            playlist_name = f"{genre} Radio"
-            self.save_playlist("Genre", playlist_name, limited_tracks)
-            self.logger.info(f"Created genre playlist '{playlist_name}' with {len(limited_tracks)} tracks from {len(unique_artists)} artists")
+        for entry in selected:
+            playlist_name = f"{entry['genre']} Radio"
+            tracks = self._select_tracks(entry['tracks'])
+            self.shared_planned += 1
+            self.save_playlist("Genre", playlist_name, tracks)
+            self.logger.info(
+                f"Genre playlist '{playlist_name}' ({entry['kind']}): {len(tracks)} tracks "
+                f"from a pool of {len(entry['tracks'])} by {entry['artists']} artists"
+            )
 
     def generate_year_playlists(self, audio_items: List[Dict]):
         """Generate playlists by decade (1980s, 1990s, 2000s, etc.)"""
@@ -2720,7 +2723,12 @@ class PlaylistGenerator:
             # Pick a random sample of the pool (see _select_tracks)
             limited_tracks = self._select_tracks(tracks)
             
+            if self.shared_planned >= self.config.max_total_playlists:
+                self.logger.info(f"⏭️  Skipping decade '{decade}': total playlist cap ({self.config.max_total_playlists}) reached")
+                continue
+            
             playlist_name = f"Back to the {decade}"
+            self.shared_planned += 1
             self.save_playlist("Decade", playlist_name, limited_tracks)
             created_playlists += 1
             self.logger.info(f"✅ Created decade playlist '{playlist_name}' with {len(limited_tracks)} tracks from {len(unique_albums)} albums and {len(unique_artists)} artists")
@@ -2760,8 +2768,6 @@ class PlaylistGenerator:
             item['Artists'] = parsed_artists
             
             for artist in parsed_artists:
-                if 'Old Mervs' in artist:
-                    self.logger.info(f"[DEBUG] Found 'Old Mervs' during collection: {repr(artist)}")
                 if artist not in artist_data:
                     artist_data[artist] = {'tracks': [], 'albums': set()}
                 artist_data[artist]['tracks'].append(item)
@@ -2776,56 +2782,27 @@ class PlaylistGenerator:
         
         self.logger.info(f"📊 Processed {processed_items} audio items, found {len(artist_data)} unique artists")
         
-        # Create playlists for each artist that meets requirements
+        # Create playlists for the biggest artists that meet the requirements
         created_playlists = 0
         skipped_artists = []
         
-        for artist, data in artist_data.items():
+        room = max(0, self.config.max_total_playlists - self.shared_planned)
+        limit = min(self.config.max_artist_playlists, room)
+        chosen = select_artist_playlists(self.config, artist_data, limit)
+        self.logger.info(f"🎤 {len(chosen)} artist playlist(s) selected (cap {self.config.max_artist_playlists}, room under the total cap {room})")
+        
+        for artist in chosen:
+            data = artist_data[artist]
             tracks = data['tracks']
-            album_count = len(data['albums'])
-            
-            # Debug logging for artist name
-            self.logger.debug(f"Processing artist: {repr(artist)}")
-            
-            # Check if artist is excluded
-            if self.config.excluded_artists and artist in self.config.excluded_artists:
-                self.logger.info(f"⏭️  Skipping excluded artist: {artist}")
-                skipped_artists.append(f"{artist} (excluded)")
-                continue
-            
-            # Check minimum track requirement
-            if len(tracks) < self.config.min_tracks_per_playlist:
-                self.logger.debug(f"Skipping {artist}: only {len(tracks)} tracks (minimum: {self.config.min_tracks_per_playlist})")
-                continue
-            
-            # Check minimum album requirement
-            if album_count < self.config.min_albums_per_artist:
-                self.logger.info(f"⏭️  Skipping {artist}: only {album_count} albums (minimum: {self.config.min_albums_per_artist})")
-                skipped_artists.append(f"{artist} ({album_count} albums)")
-                continue
-            
-            self.logger.info(f"✅ Creating playlist for {artist}: {len(tracks)} tracks from {album_count} albums")
-            
-            # Debug album information
-            self.logger.debug(f"Albums for {artist}: {list(data['albums'])}")
+            self.logger.info(f"✅ Creating playlist for {artist}: {len(tracks)} tracks from {len(data['albums'])} albums")
             
             # Pick a random sample of the pool (see _select_tracks)
             limited_tracks = self._select_tracks(tracks)
-            
-            # Create playlist name and log it for debugging
             playlist_name = f"This is {artist}!"
-            if 'Old Mervs' in artist:
-                self.logger.info(f"[DEBUG] Pre-sanitization name for 'Old Mervs': {repr(playlist_name)}")
-            self.logger.debug(f"Generated playlist name: {repr(playlist_name)}")
-            
+            self.shared_planned += 1
             playlist_dir = self.save_playlist("Artist", playlist_name, limited_tracks)
-            
             if playlist_dir:
                 created_playlists += 1
-                if 'Old Mervs' in artist:
-                    self.logger.info(f"[DEBUG] Successfully saved playlist for 'Old Mervs' in directory: {playlist_dir}")
-            elif 'Old Mervs' in artist:
-                self.logger.error(f"[DEBUG] Failed to save playlist for 'Old Mervs'. `save_playlist` returned None.")
         
         # Summary logging
         self.logger.info(f"🎤 Artist playlist generation complete: {created_playlists} playlists created")
@@ -3113,18 +3090,26 @@ class PlaylistGenerator:
             counts = self._generate_playlists()
         except Exception as e:
             self.logger.exception("Playlist generation raised an exception")
-            write_run_status(False, summary=f"{type(e).__name__}: {e}")
+            if not self.config.dry_run:
+                write_run_status(False, summary=f"{type(e).__name__}: {e}")
             raise
 
-        if counts is None:
-            write_run_status(False, summary="aborted before any playlist was written")
-        else:
-            write_run_status(True, summary="completed", counts=counts)
+        # A dry run is not a run: it must not move the health status either way.
+        if not self.config.dry_run:
+            if counts is None:
+                write_run_status(False, summary="aborted before any playlist was written")
+            else:
+                write_run_status(True, summary="completed", counts=counts)
         return counts
 
     def _generate_playlists(self):
         """Main playlist generation function. Returns counts, or None if it aborted."""
         self.created_playlists = 0
+        self.dry_run_plan = []
+        self.shared_planned = 0
+        self.planned_names = set()
+        if self.config.dry_run:
+            self.logger.info("🔎 DRY RUN: reading the library, writing nothing to Jellyfin or /data")
         self.adopt_existing_playlists()
         self.logger.info("🎵 ========== STARTING JELLYJAMS PLAYLIST GENERATION ==========")
         self.logger.info(f"🔧 Configuration: Max tracks: {self.config.max_tracks_per_playlist}, Min tracks: {self.config.min_tracks_per_playlist}")
@@ -3163,6 +3148,15 @@ class PlaylistGenerator:
             self.generate_personalized_playlists(audio_items)
         
         # Trigger Jellyfin library scan to refresh playlists if enabled
+        if self.config.dry_run:
+            self._log_dry_run_report()
+            return {'dry_run': True, 'planned': len(self.dry_run_plan)}
+        
+        retired = 0
+        if self.config.retire_stale_playlists:
+            retired = self.retire_stale_playlists()
+            self.logger.info(f"🧹 Retired {retired} playlist(s) that are no longer generated")
+
         if self.config.trigger_library_scan:
             self.logger.info("Triggering Jellyfin media library scan to refresh playlists...")
             if self.jellyfin.trigger_library_scan():
@@ -3171,13 +3165,28 @@ class PlaylistGenerator:
                 self.logger.warning("⚠️ Failed to trigger media library scan")
         
         self.logger.info("JellyJams playlist generation completed successfully!")
-        return {'playlists_created': self.created_playlists}
+        return {'playlists_created': self.created_playlists, 'playlists_retired': retired}
 
 def main():
     """Main application entry point"""
     config = Config()
+    dry_run = '--dry-run' in sys.argv[1:]
+    config.dry_run = dry_run
+    if '--retire-stale' in sys.argv[1:]:
+        config.retire_stale_playlists = True
     logger = setup_logging(config)
     
+    if dry_run or '--retire-stale' in sys.argv[1:]:
+        # One pass, no scheduling. With --dry-run nothing is written. Run it inside the
+        # container:
+        #   docker exec <container> python /app/vibecodeplugin.py --dry-run
+        #   docker exec <container> python /app/vibecodeplugin.py --retire-stale
+        if not config.api_key:
+            logger.error("JELLYFIN_API_KEY environment variable is required!")
+            sys.exit(1)
+        PlaylistGenerator(config, logger).generate_playlists()
+        return
+
     logger.info("🎵 JellyJams Generator Starting...")
     logger.info(f"Jellyfin URL: {config.jellyfin_url}")
     logger.info(f"Playlist Folder: {config.playlist_folder}")

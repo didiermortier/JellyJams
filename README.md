@@ -37,13 +37,41 @@
 >    (default 90) is widened to 365 when it holds too little, then falls back to favourites and
 >    recently played exactly as upstream did, so a quiet month does not empty the playlist. A
 >    missing plugin behaves the same as no listening history.
-> 10. **Playlists JellyJams did not create are never touched.** Deletion is gated on the name being
->    one JellyJams generates, and on `/data/managed_playlists.json`, which records the id of every
->    playlist it creates. A same-named playlist that is not in that record is left alone and the
->    replacement is skipped instead of being turned into a duplicate. A playlist of your own, named
->    anything else, can never be removed. On the first run after upgrading, the generated names
->    already on the server are adopted once, and logged, so an existing install keeps updating.
-> 11. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
+> 10. **Playlists JellyJams did not create are never touched.** A playlist is only replaced or
+>    deleted when its id is in `/data/managed_playlists.json`, which records the id of every
+>    playlist JellyJams creates, and when its name is one JellyJams generates. A name alone never
+>    proves anything: a same-named playlist that is not in the record is left alone and the
+>    replacement is skipped instead of being turned into a duplicate. A playlist of your own,
+>    named anything else, can never be removed. Nothing is adopted automatically. If you are
+>    upgrading from a version that kept no record, set `ADOPT_EXISTING_PLAYLISTS=true` for one run
+>    to take over the generated names already on the server (each one is logged), then turn it off.
+> 11. **Dry run.** `docker exec <container> python /app/vibecodeplugin.py --dry-run` does one full
+>    pass and writes nothing to Jellyfin or `/data`: no playlists, no covers, no record, no library
+>    scan, no status file. It logs what it would create, replace and skip, and lists generated-looking
+>    playlists it has no record of.
+> 12. **Fewer, better genre and artist playlists.** Genre tags are compared without regard to case
+>    and aliases are merged (`Hip Hop` and `hip hop` are one genre). The biggest 14 genres
+>    (`max_genre_playlists`) are always made, plus 2 spotlight genres (`genre_spotlight_slots`) that
+>    rotate every week through the smaller ones. A genre group that holds more than a quarter of the
+>    library is too broad to be one playlist, so its members stand alone: a house-heavy library gets
+>    House, Progressive House and Deep House instead of one huge Electronic. Artist playlists go to
+>    the 20 artists with the most tracks (`max_artist_playlists`), and genre, decade and artist
+>    playlists together never exceed `max_total_playlists` (45). All of these are on the settings
+>    page. Personal mixes are not counted.
+> 13. **Retiring old playlists.** Playlists JellyJams made earlier that a run no longer generates (the
+>    old per-genre playlists, for example) are listed by `--dry-run` under "Would RETIRE". They are
+>    only removed by `docker exec <container> python /app/vibecodeplugin.py --retire-stale`, or on
+>    every run with `RETIRE_STALE_PLAYLISTS=true`. Only playlists in the record, still under the same
+>    name, are retired; personal mixes, hand-made playlists and any kind of playlist the run made none
+>    of are never touched. To clean up an install that has no record yet, run with
+>    `ADOPT_EXISTING_PLAYLISTS=true`: the dry run then shows exactly what adopting and retiring would do.
+> 14. **Preview from the dashboard.** The "Preview (dry run)" button on the dashboard shows what the
+>    next run would create, replace, skip and retire, and changes nothing. `POST /api/dry_run` does the
+>    same, and `POST /api/retire_stale` runs one retire pass.
+> 15. **One process, fewer dependencies.** The container runs the web UI as a single process, so the
+>    generator and the UI share `/data/run_status.json`. `requirements.txt` lists only what the code
+>    imports. Artist covers use the same renderer and bundled font as the genre covers.
+> 16. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
 >    playlists included, and it removed only the folders: the Jellyfin items stayed and the scanner
 >    brought them back as empty playlists. That is one way playlists end up present but empty. It now
 >    deletes only generated names from the managed record, through the API, and reports what it left
