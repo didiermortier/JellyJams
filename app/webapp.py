@@ -6,6 +6,7 @@ JellyJams Web UI - Configuration and Management Interface
 import os
 import sys
 import json
+import re
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
@@ -601,6 +602,82 @@ def api_logs_tail():
         'line_count': len(content.split('\n')) if content else 0
     })
 
+# Allowed range of each numeric setting; the same limits as the settings form.
+SETTING_INT_RANGES = {
+    'max_tracks_per_playlist': (1, 1000), 'min_tracks_per_playlist': (1, 100),
+    'min_artist_diversity': (1, 50), 'min_albums_per_artist': (0, 50), 'min_albums_per_decade': (0, 50),
+    'generation_interval': (1, 168), 'listening_window_days': (1, 3650),
+    'personal_playlist_min_user_tracks': (1, 1000),
+    'discovery_max_songs_per_album': (1, 100), 'discovery_max_songs_per_artist': (1, 100),
+    'max_genre_playlists': (0, 100), 'genre_spotlight_slots': (0, 20),
+    'max_artist_playlists': (0, 200), 'max_total_playlists': (0, 500),
+}
+SETTING_CHOICES = {
+    'schedule_mode': ('manual', 'daily', 'weekly', 'interval'),
+    'schedule_weekday': ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'),
+    'log_level': ('DEBUG', 'INFO', 'WARNING', 'ERROR'),
+}
+PLAYLIST_TYPE_NAMES = ('Genre', 'Year', 'Artist', 'Personal')
+
+
+def validate_settings(posted, stored=None):
+    """Problems with a settings payload, as readable sentences. Empty means it is fine.
+
+    One unusable value in the settings file makes the startup loader drop every saved
+    setting and fall back to the environment, so a bad value must be refused here rather
+    than saved with a cheerful 'Settings saved'.
+    """
+    problems = []
+    merged = dict(stored or {})
+    merged.update(posted or {})
+
+    for key, (low, high) in SETTING_INT_RANGES.items():
+        if key not in posted:
+            continue
+        value = posted[key]
+        try:
+            if isinstance(value, bool) or (isinstance(value, float) and value != int(value)):
+                raise ValueError
+            number = int(str(value).strip()) if not isinstance(value, (int, float)) else int(value)
+        except (TypeError, ValueError):
+            problems.append(f"{key.replace('_', ' ')} must be a whole number")
+            continue
+        if not low <= number <= high:
+            problems.append(f"{key.replace('_', ' ')} must be between {low} and {high}")
+        else:
+            merged[key] = number
+
+    if 'genre_split_share' in posted:
+        try:
+            if not 0 <= float(posted['genre_split_share']) <= 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            problems.append('genre split share must be a number between 0 and 1')
+
+    for key, allowed in SETTING_CHOICES.items():
+        if key in posted and str(posted[key]) not in allowed:
+            problems.append(f"{key.replace('_', ' ')} must be one of: {', '.join(allowed)}")
+
+    if 'schedule_time' in posted and not re.fullmatch(r'([01]?\d|2[0-3]):[0-5]\d', str(posted['schedule_time']).strip()):
+        problems.append('schedule time must look like 04:30')
+
+    if 'playlist_types' in posted:
+        types = posted['playlist_types']
+        if not isinstance(types, list) or not all(t in PLAYLIST_TYPE_NAMES for t in types):
+            problems.append(f"playlist types must be a list of: {', '.join(PLAYLIST_TYPE_NAMES)}")
+
+    if 'jellyfin_url' in posted and not re.match(r'https?://\S+$', str(posted['jellyfin_url']).strip()):
+        problems.append('Jellyfin URL must start with http:// or https://')
+
+    low_tracks, high_tracks = merged.get('min_tracks_per_playlist'), merged.get('max_tracks_per_playlist')
+    if (isinstance(low_tracks, int) and isinstance(high_tracks, int) and low_tracks > high_tracks
+            and ('min_tracks_per_playlist' in posted or 'max_tracks_per_playlist' in posted)
+            and not any('tracks per playlist' in p for p in problems)):
+        problems.append('minimum tracks per playlist cannot be more than the maximum')
+
+    return problems
+
+
 @app.route('/api/settings', methods=['GET', 'POST'])
 @requires_auth
 def api_settings():
@@ -632,9 +709,18 @@ def api_settings():
     
     elif request.method == 'POST':
         try:
-            settings = keep_stored_secrets(request.json)
+            posted = request.get_json(silent=True)
+            if not isinstance(posted, dict):
+                return jsonify({'success': False, 'message': 'Not saved: the settings were not sent as JSON.'}), 400
+            settings = keep_stored_secrets(posted)
             # Load previous settings to compute diffs for logging
             previous_settings = config_manager.load_settings()
+
+            problems = validate_settings(settings, previous_settings)
+            if problems:
+                logger.warning(f"Settings not saved: {'; '.join(problems)}")
+                return jsonify({'success': False, 'errors': problems,
+                                'message': 'Not saved: ' + '; '.join(problems) + '.'}), 400
 
             # Helper to redact sensitive values
             def _redact(key, value):
