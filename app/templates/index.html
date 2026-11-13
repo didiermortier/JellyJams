@@ -18,6 +18,18 @@
     </div>
 </div>
 
+<div id="runProgress" class="card mb-3" hidden aria-live="polite">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-baseline mb-2">
+            <strong id="progressStage">Starting...</strong>
+            <span class="text-muted small" id="progressCount"></span>
+        </div>
+        <div class="progress" role="progressbar" aria-label="Generation progress">
+            <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+        </div>
+    </div>
+</div>
+
 <div class="tiles mb-4">
     <a class="tile" href="{{ url_for('playlists') }}#all"><span class="n text-primary">{{ playlist_stats.total }}</span><span class="l">Total Playlists</span></a>
     <a class="tile" href="{{ url_for('playlists') }}#genre"><span class="n text-success">{{ playlist_stats.genre }}</span><span class="l">Genre Playlists</span></a>
@@ -88,6 +100,13 @@
     </div>
 </div>
 
+<div class="card mb-3">
+    <div class="card-body">
+        <h2 class="panel-title"><i class="fa-solid fa-eye"></i>What the next run would change</h2>
+        <div id="previewBox" class="text-muted">Checking...</div>
+    </div>
+</div>
+
 <div class="card">
     <div class="card-body">
         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
@@ -154,6 +173,7 @@ function generatePlaylists() {
     const button = $('button[onclick="generatePlaylists()"]');
     const originalText = button.html();
     showSpinner(button);
+    watchProgress();
 
     $.post('/api/generate', function(data) {
         hideSpinner(button, originalText);
@@ -185,6 +205,7 @@ function dryRun() {
             button.prop('disabled', false);
             button.html(originalText);
             if (!data.success) { showAlert('Preview failed: ' + data.message, 'danger'); return; }
+            loadPreview();
             const r = data.report;
             const groups = [['create', 'Would create'], ['replace', 'Would replace (made by JellyJams)'],
                             ['skip', 'Would skip (someone else made that name)']];
@@ -240,19 +261,100 @@ function generatePersonalizedPlaylists() {
     });
 }
 
+function formatDuration(seconds) {
+    if (seconds == null) return '';
+    const m = Math.floor(seconds / 60), r = seconds % 60;
+    return m ? m + ' min ' + r + ' s' : r + ' s';
+}
+
 function showLastRun() {
-    $.get('/api/health', function(data) {
-        const run = data.last_run;
-        if (!run || typeof run === 'string') { $('#lastRun').text('No run recorded yet'); return; }
-        const when = run.last_run_finished ? new Date(run.last_run_finished).toLocaleString() : 'unknown time';
-        const made = run.counts && run.counts.playlists_created != null ? ', ' + run.counts.playlists_created + ' playlists written' : '';
-        $('#lastRun').text(when + (run.success === false ? ' (failed)' : made));
-    }).fail(function() { $('#lastRun').text('Unavailable'); });
+    // /api/health answers 503 when the last run failed, and that body is the one to show.
+    $.ajax({url: '/api/health', dataType: 'json'}).done(renderLastRun).fail(function(xhr) {
+        if (xhr.responseJSON) { renderLastRun(xhr.responseJSON); } else { $('#lastRun').text('Unavailable'); }
+    });
+}
+
+function renderLastRun(data) {
+    const run = data.last_run;
+    if (!run || typeof run === 'string') { $('#lastRun').text('No run recorded yet'); return; }
+    const when = run.last_run_finished ? new Date(run.last_run_finished).toLocaleString() : 'unknown time';
+    const parts = [when];
+    if (run.success === false) {
+        parts.push('failed' + (run.summary ? ': ' + run.summary : ''));
+    } else if (run.counts && run.counts.playlists_created != null) {
+        parts.push(run.counts.playlists_created + ' playlists written');
+    }
+    if (run.duration_seconds != null) parts.push('took ' + formatDuration(run.duration_seconds));
+    if (run.errors != null) parts.push(run.errors + (run.errors === 1 ? ' error' : ' errors'));
+    $('#lastRun').text(parts.join(', ')).toggleClass('text-danger', run.success === false).toggleClass('text-muted', run.success !== false);
+}
+
+function nameList(names, max) {
+    max = max || 6;
+    const shown = names.slice(0, max).map(escapeHtml).join(', ');
+    return shown + (names.length > max ? ' and ' + (names.length - max) + ' more' : '');
+}
+
+function loadPreview() {
+    $.get('/api/last_preview', function(data) {
+        const p = data.preview;
+        const box = $('#previewBox');
+        if (!p) {
+            box.html('No preview yet. Press <strong>Preview (dry run)</strong> to see what the next run would create, refresh or retire. Nothing is changed by it.');
+            return;
+        }
+        const when = p.when ? new Date(p.when).toLocaleString() : '';
+        if (p.outdated) {
+            box.html('The last preview (' + escapeHtml(when) + ') is from before the latest run, so it no longer applies. Press <strong>Preview (dry run)</strong> again.');
+            return;
+        }
+        let rows = '';
+        if (p.create.length) rows += '<div class="py-1"><span class="text-success fw-semibold">+ ' + p.create.length + ' new</span> &nbsp;' + nameList(p.create) + '</div>';
+        if (p.retire.length) rows += '<div class="py-1"><span class="text-danger fw-semibold">- ' + p.retire.length + ' retired</span> &nbsp;' + nameList(p.retire) + '</div>';
+        if (p.replace) rows += '<div class="py-1">' + p.replace + ' refreshed with a new track order</div>';
+        if (p.skip.length) rows += '<div class="py-1 text-warning">' + p.skip.length + ' skipped because someone else made that name: ' + nameList(p.skip) + '</div>';
+        if (!p.create.length && !p.retire.length && !p.skip.length && !p.replace) rows = '<div class="py-1">Nothing to do.</div>';
+        const manual = parseInt($('.tile').last().find('.n').text(), 10);
+        if (manual > 0) rows += '<div class="py-1">' + manual + ' hand-made playlists are never touched.</div>';
+        box.html(rows + '<div class="small mt-2">Preview taken ' + escapeHtml(when) + '.</div>').removeClass('text-muted');
+    }).fail(function() { $('#previewBox').text('Unavailable'); });
+}
+
+let progressTimer = null;
+
+function watchProgress() {
+    if (progressTimer) return;
+    let sawRunning = false;
+    const tick = function() {
+        $.get('/api/progress', function(p) {
+            if (!p.running) {
+                // A run this page was watching has finished: stop and show the new numbers.
+                if (sawRunning) { clearInterval(progressTimer); progressTimer = null; location.reload(); }
+                return;
+            }
+            sawRunning = true;
+            $('#runProgress').prop('hidden', false);
+            $('#progressStage').text(p.stage || 'Working...');
+            const bar = $('#progressBar');
+            if (p.percent != null) {
+                bar.removeClass('progress-bar-striped progress-bar-animated').css('width', p.percent + '%');
+                $('#progressCount').text(p.written + ' of about ' + p.expected + ' playlists');
+            } else {
+                bar.addClass('progress-bar-striped progress-bar-animated').css('width', '100%');
+                $('#progressCount').text(p.written + ' playlists written');
+            }
+        });
+    };
+    tick();
+    progressTimer = setInterval(tick, 2000);
 }
 
 $(document).ready(function() {
     updateConnectionStatus();
     showLastRun();
+    loadPreview();
+    // A scheduled run, or one started from another tab, shows its progress here too.
+    $.get('/api/progress', function(p) { if (p.running) watchProgress(); });
 });
 </script>
 {% endblock %}

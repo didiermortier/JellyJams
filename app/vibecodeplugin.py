@@ -783,6 +783,7 @@ class DryRunWriteError(RuntimeError):
 
 
 RUN_STATUS_FILE = '/data/run_status.json'
+PROGRESS_FILE = '/data/progress.json'
 MANAGED_PLAYLISTS_FILE = '/data/managed_playlists.json'
 
 
@@ -842,7 +843,47 @@ def save_managed_playlists(mapping: Dict[str, str]):
         logging.getLogger('jellyjams').warning(f"Could not write the managed playlist list: {e}")
 
 
-def write_run_status(success: bool, summary: str = '', counts: Optional[Dict] = None):
+def _write_json_atomic(path: str, payload: Dict):
+    """Write a small JSON file in the data volume so a reader never sees half of it."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(target)
+
+
+def write_progress(running: bool, stage: str = '', written: int = 0, expected: int = 0, started: str = ''):
+    """Say what a running generation is doing, for the dashboard's progress bar.
+
+    Never raises: reporting progress must not be what breaks a run.
+    """
+    try:
+        _write_json_atomic(PROGRESS_FILE, {
+            'running': bool(running), 'stage': stage, 'written': written,
+            'expected': expected, 'started': started,
+            'updated': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        })
+    except Exception as e:
+        logging.getLogger('jellyjams').warning(f"Could not write progress: {e}")
+
+
+class _ProblemCounter(logging.Handler):
+    """Counts the warnings and errors logged while a run is going."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.errors = 0
+        self.warnings = 0
+
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            self.errors += 1
+        else:
+            self.warnings += 1
+
+
+def write_run_status(success: bool, summary: str = '', counts: Optional[Dict] = None, **details):
     """Record how the last generation went, so a failed run is visible outside the log.
 
     Written into the app data volume and read by /api/health and the container
@@ -856,12 +897,9 @@ def write_run_status(success: bool, summary: str = '', counts: Optional[Dict] = 
             'summary': summary,
             'counts': counts or {},
         }
-        path = Path(RUN_STATUS_FILE)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix('.tmp')
-        with open(tmp, 'w') as f:
-            json.dump(payload, f, indent=2)
-        tmp.replace(path)
+        # How long it took and how many problems it logged, when the caller knows.
+        payload.update({k: v for k, v in details.items() if v is not None})
+        _write_json_atomic(RUN_STATUS_FILE, payload)
     except Exception as e:
         logging.getLogger('jellyjams').warning(f"Could not write run status: {e}")
 
@@ -2513,6 +2551,7 @@ class PlaylistGenerator:
             
             if result['success']:
                 self.created_playlists += 1
+                self._report_progress(f"Writing playlists ({playlist_type})")
                 new_id = result.get('playlist_id')
                 if new_id:
                     managed = load_managed_playlists()
@@ -3112,21 +3151,46 @@ class PlaylistGenerator:
 
     def generate_playlists(self):
         """Run one generation pass and record its outcome for monitoring."""
+        live = not self.config.dry_run        # a dry run is not a run: no status, no progress
+        began = time.monotonic()
+        started = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        problems = _ProblemCounter()
+        self.logger.addHandler(problems)
+        self._progress_started = started
+        # The last run's size is the best guess of how many playlists this one will write.
+        self._progress_expected = len(load_managed_playlists()) if live else 0
+        if live:
+            write_progress(True, 'Reading the library', 0, self._progress_expected, started)
         try:
             counts = self._generate_playlists()
         except Exception as e:
             self.logger.exception("Playlist generation raised an exception")
-            if not self.config.dry_run:
-                write_run_status(False, summary=f"{type(e).__name__}: {e}")
+            if live:
+                write_run_status(False, summary=f"{type(e).__name__}: {e}",
+                                 duration_seconds=round(time.monotonic() - began), errors=problems.errors + 1,
+                                 warnings=problems.warnings)
             raise
+        finally:
+            self.logger.removeHandler(problems)
+            if live:
+                write_progress(False, started=started)
 
-        # A dry run is not a run: it must not move the health status either way.
-        if not self.config.dry_run:
+        if live:
+            took = round(time.monotonic() - began)
             if counts is None:
-                write_run_status(False, summary="aborted before any playlist was written")
+                write_run_status(False, summary="aborted before any playlist was written",
+                                 duration_seconds=took, errors=problems.errors, warnings=problems.warnings)
             else:
-                write_run_status(True, summary="completed", counts=counts)
+                write_run_status(True, summary="completed", counts=counts,
+                                 duration_seconds=took, errors=problems.errors, warnings=problems.warnings)
         return counts
+
+    def _report_progress(self, stage: str):
+        """Tell the dashboard which stage a live run is in and how many playlists are done."""
+        if self.config.dry_run or not getattr(self, '_progress_started', ''):
+            return
+        write_progress(True, stage, self.created_playlists,
+                       getattr(self, '_progress_expected', 0), self._progress_started)
 
     def _generate_playlists(self):
         """Main playlist generation function. Returns counts, or None if it aborted."""
@@ -3162,15 +3226,19 @@ class PlaylistGenerator:
         
         # Generate playlists based on configuration
         if 'Genre' in self.config.playlist_types:
+            self._report_progress('Genre playlists')
             self.generate_genre_playlists(audio_items)
         
         if 'Year' in self.config.playlist_types:
+            self._report_progress('Decade playlists')
             self.generate_year_playlists(audio_items)
         
         if 'Artist' in self.config.playlist_types:
+            self._report_progress('Artist playlists')
             self.generate_artist_playlists(audio_items)
         
         if 'Personal' in self.config.playlist_types:
+            self._report_progress('Personal mixes')
             self.generate_personalized_playlists(audio_items)
         
         # Trigger Jellyfin library scan to refresh playlists if enabled
