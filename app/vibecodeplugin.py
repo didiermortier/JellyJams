@@ -70,6 +70,11 @@ class Config:
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         # Media library scan after playlist creation
         self.trigger_library_scan = os.getenv('TRIGGER_LIBRARY_SCAN', 'true').lower() == 'true'
+        # Playlists with a generated-looking name that JellyJams has no record of are left
+        # alone. Set ADOPT_EXISTING_PLAYLISTS=true for one run to take them over.
+        self.adopt_existing_playlists = os.getenv('ADOPT_EXISTING_PLAYLISTS', 'false').lower() == 'true'
+        # Set by `python vibecodeplugin.py --dry-run`: read everything, write nothing.
+        self.dry_run = False
         
         # Set default values for web UI configurable variables
         self.generation_interval = 24
@@ -744,6 +749,10 @@ def setup_logging(config: Config):
     
     return logger
 
+class DryRunWriteError(RuntimeError):
+    """A write to Jellyfin was attempted during a dry run. Always a bug in the caller."""
+
+
 RUN_STATUS_FILE = '/data/run_status.json'
 MANAGED_PLAYLISTS_FILE = '/data/managed_playlists.json'
 
@@ -791,16 +800,6 @@ def load_managed_playlists() -> Dict[str, str]:
     except Exception as e:
         logging.getLogger('jellyjams').warning(f"Could not read the managed playlist list: {e}")
     return {}
-
-
-def playlist_bookkeeping_is_new() -> bool:
-    """True when JellyJams has no record yet of the playlists it created.
-
-    Read once per run, in PlaylistGenerator.__init__, because the record file is written
-    as soon as that run creates its first playlist and every later playlist in the same
-    run still needs to know that the install predates the bookkeeping.
-    """
-    return not Path(MANAGED_PLAYLISTS_FILE).exists()
 
 
 def save_managed_playlists(mapping: Dict[str, str]):
@@ -994,6 +993,11 @@ class JellyfinAPI:
             'Authorization': f'MediaBrowser Token={config.api_key}',
             'Content-Type': 'application/json'
         })
+
+    def _refuse_write(self, action: str):
+        """Safety net: callers check dry_run first, so reaching this is a bug."""
+        if getattr(self.config, 'dry_run', False):
+            raise DryRunWriteError(f"Refusing to {action} during a dry run")
 
     def get_audio_items(self) -> List[Dict]:
         """Get all audio items from Jellyfin"""
@@ -1258,6 +1262,7 @@ class JellyfinAPI:
 
     def create_playlist(self, name: str, track_ids: List[str], user_id: str = None, is_public: bool = True) -> Dict:
         """Create a playlist using Jellyfin's REST API"""
+        self._refuse_write('create a playlist')
         try:
             # If no user_id provided, get the first available user
             if not user_id:
@@ -1381,6 +1386,7 @@ class JellyfinAPI:
 
     def delete_playlist(self, playlist_id: str) -> bool:
         """Delete a playlist by ID"""
+        self._refuse_write('delete a playlist')
         try:
             url = f"{self.config.jellyfin_url}/Items/{playlist_id}"
             response = self.session.delete(url)
@@ -1395,6 +1401,7 @@ class JellyfinAPI:
 
     def trigger_library_scan(self) -> bool:
         """Trigger a media library scan in Jellyfin to refresh playlists"""
+        self._refuse_write('trigger a library scan')
         try:
             url = f"{self.config.jellyfin_url}/Library/Refresh"
             response = self.session.post(url)
@@ -1411,10 +1418,9 @@ class PlaylistGenerator:
     def __init__(self, config: Config, logger):
         self.config = config
         self.logger = logger
-        # Decided once per run, before this run creates anything: the record file is
-        # written as soon as the first playlist is created, and every later playlist in
-        # the same run still has to know whether the install predates the bookkeeping.
-        self.bookkeeping_is_new = playlist_bookkeeping_is_new()
+        # What a dry run found: one entry per playlist this run would create, replace
+        # or skip. Stays empty on a normal run.
+        self.dry_run_plan: List[Dict] = []
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
@@ -1481,14 +1487,15 @@ class PlaylistGenerator:
             self.logger.debug(f"Could not remove playlist folder {jellyfin_path}: {e}")
 
     def adopt_existing_playlists(self) -> int:
-        """Record the playlists JellyJams created before it kept a record.
+        """Take over playlists that carry a generated name but are not in the record.
 
-        Runs once, only while the record is new. It adopts every existing playlist whose
-        name is one JellyJams generates, so an install that predates the bookkeeping
-        keeps updating itself, including names this run does not happen to generate.
-        Nothing else is adopted, so a hand-made playlist is never claimed.
+        Off unless ADOPT_EXISTING_PLAYLISTS=true. A name is no proof that JellyJams made
+        a playlist, so nothing is claimed by default: a playlist that is not in
+        managed_playlists.json is left alone. Turn it on for one run when upgrading from
+        a version that kept no record. Only generated names are adopted, so a hand-made
+        playlist is never claimed, and every adoption is logged.
         """
-        if not self.bookkeeping_is_new:
+        if not self.config.adopt_existing_playlists or self.config.dry_run:
             return 0
 
         managed = load_managed_playlists()
@@ -1498,23 +1505,61 @@ class PlaylistGenerator:
             if name and is_generated_playlist_name(name) and managed.get(name) != item.get('Id'):
                 managed[name] = item.get('Id')
                 adopted += 1
+                self.logger.info(f"📋 Adopted existing playlist '{name}' (id {item.get('Id')})")
 
         if adopted:
             save_managed_playlists(managed)
-            self.logger.info(
-                f"📋 Adopted {adopted} playlist(s) that JellyJams created before it kept a record"
-            )
+            self.logger.info(f"📋 Adopted {adopted} playlist(s). Turn ADOPT_EXISTING_PLAYLISTS off again.")
         return adopted
+
+    def _classify_existing(self, name: str, user_id: str):
+        """Split the playlists called `name` into (ours, foreign). Reads only.
+
+        Ours means the playlist id is the one JellyJams recorded when it created it.
+        Everything else with that name, including a hand-made playlist, is foreign.
+        """
+        managed = load_managed_playlists()
+        ours, foreign = [], []
+        for item in self.jellyfin.find_playlists_by_name(name, user_id):
+            (ours if managed.get(name) == item.get('Id') else foreign).append(item)
+        return ours, foreign
+
+    def dry_run_report(self) -> Dict:
+        """What a dry run would do, plus generated-looking playlists it will not touch."""
+        managed_ids = set(load_managed_playlists().values())
+        unrecorded = sorted(
+            item.get('Name') for item in self.jellyfin.list_playlists()
+            if is_generated_playlist_name(item.get('Name', '')) and item.get('Id') not in managed_ids
+        )
+        return {'plan': list(self.dry_run_plan), 'unrecorded_generated': unrecorded}
+
+    def _log_dry_run_report(self):
+        report = self.dry_run_report()
+        by_action: Dict[str, List[Dict]] = {'create': [], 'replace': [], 'skip': []}
+        for entry in report['plan']:
+            by_action[entry['action']].append(entry)
+
+        lines = ["", "================ JellyJams DRY RUN: nothing was changed ================"]
+        for action, label in (('create', 'Would CREATE'), ('replace', 'Would REPLACE (created by JellyJams)'),
+                              ('skip', 'Would SKIP (a playlist of that name exists that JellyJams did not create)')):
+            entries = by_action[action]
+            lines.append(f"{label}: {len(entries)}")
+            lines.extend(f"    {e['name']}  [{e['type']}, {e['tracks']} tracks]" for e in entries)
+        unrecorded = report['unrecorded_generated']
+        lines.append(f"Generated-looking playlists JellyJams has no record of, left alone: {len(unrecorded)}")
+        lines.extend(f"    {name}" for name in unrecorded)
+        if unrecorded:
+            lines.append("    (set ADOPT_EXISTING_PLAYLISTS=true for one run to take these over)")
+        lines.append("========================================================================")
+        for line in lines:
+            self.logger.info(line)
 
     def _remove_existing_playlists(self, name: str, user_id: str):
         """Remove our own playlist with this name and its folder.
 
-        Returns (rollback_track_ids, skip). Only playlists JellyJams created are removed:
-        one made by hand is left alone even when it shares a name with a generated one,
-        and the replacement is skipped rather than left as a duplicate. On the very first
-        run, generated names already present are adopted once, which is what lets an
-        install that predates this bookkeeping keep updating itself, and every adopted
-        name is logged.
+        Returns (rollback_track_ids, skip). Only a playlist whose id JellyJams recorded
+        is removed. One made by hand is left alone even when it shares a name with a
+        generated one, and the replacement is skipped rather than left as a duplicate.
 
         Jellyfin derives the playlist folder from the name and appends a number when that
         name is taken, so the name has to be freed before the create or it lands in
@@ -1526,35 +1571,22 @@ class PlaylistGenerator:
             self.logger.warning(f"Refusing to manage '{name}': JellyJams does not generate that name")
             return [], True
 
-        existing = self.jellyfin.find_playlists_by_name(name, user_id)
-        if not existing:
-            self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
-            return [], False
-
-        managed = load_managed_playlists()
-        first_run = self.bookkeeping_is_new
-
-        ours, foreign = [], []
-        for item in existing:
-            if managed.get(name) == item.get('Id') or first_run:
-                ours.append(item)
-            else:
-                foreign.append(item)
+        ours, foreign = self._classify_existing(name, user_id)
 
         if foreign:
             self.logger.warning(
-                f"⚠️ A playlist named '{name}' exists but was not created by JellyJams. "
-                f"Leaving it untouched and skipping that name. Rename or remove it if "
-                f"JellyJams should manage it again."
+                f"⚠️ A playlist named '{name}' exists but was not created by JellyJams "
+                f"(it is not in the record). Leaving it untouched and skipping that name. "
+                f"Rename or remove it if JellyJams should manage the name again, or set "
+                f"ADOPT_EXISTING_PLAYLISTS=true for one run."
             )
             return [], True
 
+        if not ours:
+            self.logger.info(f"ℹ️ No existing playlist found with name: {name}")
+            return [], False
+
         self.logger.info(f"Found {len(ours)} existing playlist(s) named '{name}'")
-        if first_run:
-            self.logger.info(
-                f"📋 First run with playlist bookkeeping: adopting '{name}' "
-                f"(and the other names JellyJams generates) as managed"
-            )
 
         rollback_tracks: List[str] = []
         for item in ours:
@@ -2416,6 +2448,18 @@ class PlaylistGenerator:
             
             self.logger.info(f"Creating {privacy_text} {playlist_type} playlist: {sanitized_name} with {len(track_ids)} tracks")
             
+            if self.config.dry_run:
+                api_name = normalize_name(name)
+                if not is_generated_playlist_name(api_name):
+                    action = 'skip'
+                else:
+                    ours, foreign = self._classify_existing(api_name, user_id)
+                    action = 'skip' if foreign else ('replace' if ours else 'create')
+                self.dry_run_plan.append({'name': api_name, 'type': playlist_type,
+                                          'action': action, 'tracks': len(track_ids)})
+                self.logger.info(f"🔎 DRY RUN: would {action} '{api_name}' ({len(track_ids)} tracks)")
+                return None
+
             # Jellyfin names each playlist's folder after the playlist and appends a
             # number when that name is taken, so creating a second copy before removing
             # the first gives you "House Radio" and "House Radio1". The folder also
@@ -3127,18 +3171,24 @@ class PlaylistGenerator:
             counts = self._generate_playlists()
         except Exception as e:
             self.logger.exception("Playlist generation raised an exception")
-            write_run_status(False, summary=f"{type(e).__name__}: {e}")
+            if not self.config.dry_run:
+                write_run_status(False, summary=f"{type(e).__name__}: {e}")
             raise
 
-        if counts is None:
-            write_run_status(False, summary="aborted before any playlist was written")
-        else:
-            write_run_status(True, summary="completed", counts=counts)
+        # A dry run is not a run: it must not move the health status either way.
+        if not self.config.dry_run:
+            if counts is None:
+                write_run_status(False, summary="aborted before any playlist was written")
+            else:
+                write_run_status(True, summary="completed", counts=counts)
         return counts
 
     def _generate_playlists(self):
         """Main playlist generation function. Returns counts, or None if it aborted."""
         self.created_playlists = 0
+        self.dry_run_plan = []
+        if self.config.dry_run:
+            self.logger.info("🔎 DRY RUN: reading the library, writing nothing to Jellyfin or /data")
         self.adopt_existing_playlists()
         self.logger.info("🎵 ========== STARTING JELLYJAMS PLAYLIST GENERATION ==========")
         self.logger.info(f"🔧 Configuration: Max tracks: {self.config.max_tracks_per_playlist}, Min tracks: {self.config.min_tracks_per_playlist}")
@@ -3177,6 +3227,10 @@ class PlaylistGenerator:
             self.generate_personalized_playlists(audio_items)
         
         # Trigger Jellyfin library scan to refresh playlists if enabled
+        if self.config.dry_run:
+            self._log_dry_run_report()
+            return {'dry_run': True, 'planned': len(self.dry_run_plan)}
+
         if self.config.trigger_library_scan:
             self.logger.info("Triggering Jellyfin media library scan to refresh playlists...")
             if self.jellyfin.trigger_library_scan():
@@ -3190,8 +3244,19 @@ class PlaylistGenerator:
 def main():
     """Main application entry point"""
     config = Config()
+    dry_run = '--dry-run' in sys.argv[1:]
+    config.dry_run = dry_run
     logger = setup_logging(config)
     
+    if dry_run:
+        # One pass, no scheduling, nothing written. Run it inside the container:
+        #   docker exec <container> python /app/vibecodeplugin.py --dry-run
+        if not config.api_key:
+            logger.error("JELLYFIN_API_KEY environment variable is required!")
+            sys.exit(1)
+        PlaylistGenerator(config, logger).generate_playlists()
+        return
+
     logger.info("🎵 JellyJams Generator Starting...")
     logger.info(f"Jellyfin URL: {config.jellyfin_url}")
     logger.info(f"Playlist Folder: {config.playlist_folder}")

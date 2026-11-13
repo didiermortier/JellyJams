@@ -21,6 +21,7 @@ services:
       - DISCOVERY_MAX_SONGS_PER_ARTIST=${DISCOVERY_MAX_SONGS_PER_ARTIST}
       # Trigger Jellyfin media library scan after playlist creation
       - TRIGGER_LIBRARY_SCAN=${TRIGGER_LIBRARY_SCAN}
+      - ADOPT_EXISTING_PLAYLISTS=${ADOPT_EXISTING_PLAYLISTS:-false}
       # Web UI Security (environment variables override web UI settings)
       - WEBUI_BASIC_AUTH_ENABLED=${WEBUI_BASIC_AUTH_ENABLED}
       - WEBUI_BASIC_AUTH_USERNAME=${WEBUI_BASIC_AUTH_USERNAME}
