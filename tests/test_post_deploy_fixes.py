@@ -124,4 +124,5 @@ def test_dashboard_shows_the_real_schedule(webapp_module, monkeypatch, settings,
 
     assert page.status_code == 200
     assert expected.encode() in page.data
-    assert (b"Disabled" in page.data) == (settings["schedule_mode"] == "manual")
+    assert (b">Off<" in page.data) == (settings["schedule_mode"] == "manual")
+    assert (b">On<" in page.data) == (settings["schedule_mode"] != "manual")

@@ -16,7 +16,7 @@
 </head>
 <body>
     <div class="app-shell">
-        <aside class="sidebar">
+        <aside class="sidebar" id="sidebar">
             <a class="brand" href="{{ url_for('index') }}">
                 <img src="{{ url_for('logo') }}" alt="JellyJams" />
                 <span>JellyJams</span>
@@ -40,14 +40,16 @@
                 </a>
             </nav>
         </aside>
+        <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
 
-        <header class="header">
-            <div class="d-flex align-items-center gap-2">
-                <div id="connection-status" class="badge"><span class="dot"></span> Checking...</div>
-            </div>
-            <div class="actions">
-                {% block header_actions %}{% endblock %}
-            </div>
+        <header class="topbar">
+            <button type="button" class="menu-btn" id="menuBtn" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <i class="fa-solid fa-bars"></i>
+            </button>
+            <span class="topbar-brand">JellyJams</span>
+            <span class="spacer"></span>
+            <div id="connection-status" class="status-pill" role="status"><span class="dot"></span> Checking...</div>
+            {% block header_actions %}{% endblock %}
         </header>
 
         <main class="main">
@@ -65,6 +67,7 @@
             {% block content %}{% endblock %}
         </main>
     </div>
+    <div id="toasts" aria-live="polite"></div>
 
     <script src="{{ url_for('static', filename='js/bootstrap.bundle.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/jquery-3.7.1.min.js') }}"></script>
@@ -79,26 +82,59 @@
             button.html(originalText).prop('disabled', false);
         }
 
+        // Messages show in a fixed corner so they are seen wherever the page is scrolled.
         function showAlert(message, type = 'success') {
-            const alertHtml = `
-                <div class="alert alert-${type} alert-dismissible fade show" role="alert">
-                    ${message}
-                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                </div>
-            `;
-            document.querySelector('main.main').insertAdjacentHTML('afterbegin', alertHtml);
+            const box = document.createElement('div');
+            box.className = `alert alert-${type} alert-dismissible fade show`;
+            box.setAttribute('role', type === 'danger' ? 'alert' : 'status');
+            const text = document.createElement('span');
+            text.textContent = message;
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'btn-close';
+            close.setAttribute('data-bs-dismiss', 'alert');
+            close.setAttribute('aria-label', 'Close');
+            box.append(text, close);
+            document.getElementById('toasts').appendChild(box);
+            // Errors stay until dismissed; everything else clears itself.
+            if (type !== 'danger') {
+                setTimeout(() => bootstrap.Alert.getOrCreateInstance(box).close(), 7000);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text == null ? '' : String(text);
+            return div.innerHTML;
+        }
+
+        function setConnection(connected) {
+            const pill = $('#connection-status');
+            pill.toggleClass('ok', connected).toggleClass('bad', !connected);
+            pill.html('<span class="dot"></span> ' + (connected ? 'Connected' : 'Disconnected'));
+            $('.js-conn-status').html(connected
+                ? '<i class="fa-solid fa-circle-check text-success"></i> Connected'
+                : '<i class="fa-solid fa-circle-xmark text-danger"></i> Disconnected');
         }
 
         function updateConnectionStatus() {
-            $.get('/api/jellyfin_test', function(data) {
-                const statusElement = $('#connection-status');
-                if (data.connected) {
-                    statusElement.html('<span class="dot"></span> Connected');
-                } else {
-                    statusElement.html('<span class="dot" style="background:#ef4444; box-shadow:0 0 10px rgba(239,68,68,.6);"></span> Disconnected');
-                }
-            });
+            return $.get('/api/jellyfin_test', function(data) {
+                setConnection(!!data.connected);
+            }).fail(function() { setConnection(false); });
         }
+
+        // Menu drawer (phones and tablets)
+        (function() {
+            const btn = document.getElementById('menuBtn');
+            function set(open) {
+                document.body.classList.toggle('sidebar-open', open);
+                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+            }
+            btn.addEventListener('click', () => set(!document.body.classList.contains('sidebar-open')));
+            document.getElementById('sidebarBackdrop').addEventListener('click', () => set(false));
+            document.addEventListener('keydown', e => { if (e.key === 'Escape') set(false); });
+        })();
+
         updateConnectionStatus();
         setInterval(updateConnectionStatus, 30000);
     </script>

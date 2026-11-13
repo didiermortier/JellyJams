@@ -464,6 +464,7 @@ def index():
     return render_template('index.html', 
                          settings=settings,
                          playlist_stats=playlist_stats,
+                         playlist_folder=config.playlist_folder,
                          jellyfin_connected=jellyfin_connected)
 
 @app.route('/settings')
@@ -1517,6 +1518,9 @@ def get_playlist_stats():
         logger.error(f"Error getting playlist stats: {e}")
         return {'total': 0, 'genre': 0, 'year': 0, 'artist': 0, 'personal': 0, 'manual': 0}
 
+PLAYLIST_CATEGORY_ORDER = {'genre': 0, 'year': 1, 'artist': 2, 'personal': 3, 'manual': 4}
+
+
 def get_detailed_playlist_info():
     """Get detailed playlist information with proper categorization"""
     try:
@@ -1671,7 +1675,8 @@ def get_detailed_playlist_info():
                     })
         
         return {
-            'playlists': sorted(playlists, key=lambda x: x['name']),
+            # What JellyJams made comes first, hand-made playlists after, each group by name.
+            'playlists': sorted(playlists, key=lambda x: (PLAYLIST_CATEGORY_ORDER.get(x['category'], 9), x['name'].lower())),
             'stats': stats
         }
     except Exception as e:
