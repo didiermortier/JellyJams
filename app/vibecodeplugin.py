@@ -25,7 +25,7 @@ from io import BytesIO
 # Pillow is a hard requirement: the genre cover fallback draws with it.
 from PIL import Image
 
-from genre_cover import find_cover, render_genre_cover
+from genre_cover import find_cover, render_artist_cover, render_genre_cover
 
 # Configuration
 SETTINGS_FILE = '/data/config/settings.json'
@@ -104,6 +104,8 @@ class Config:
 
         # Deezer cover art (public API, no key or account needed)
         self.deezer_cover_art_enabled = False
+        # Draw "THIS IS / <artist>" on artist covers. Off leaves the plain photo.
+        self.artist_cover_name_overlay = os.getenv('ARTIST_COVER_NAME_OVERLAY', 'true').lower() == 'true'
         
         # User configuration for personalized playlists
         self.personal_playlist_users = 'all'
@@ -183,6 +185,8 @@ class Config:
                     self.spotify_cover_art_enabled = bool(web_settings['spotify_cover_art_enabled'])
                 if 'deezer_cover_art_enabled' in web_settings:
                     self.deezer_cover_art_enabled = bool(web_settings['deezer_cover_art_enabled'])
+                if 'artist_cover_name_overlay' in web_settings:
+                    self.artist_cover_name_overlay = bool(web_settings['artist_cover_name_overlay'])
                 
                 # User configuration for personalized playlists
                 if 'personal_playlist_users' in web_settings:
@@ -961,7 +965,16 @@ class DeezerClient:
                 image = image.resize((1000, 1000), PILImage.Resampling.LANCZOS)
 
             target = playlist_dir / 'cover.jpg'
-            image.save(target, 'JPEG', quality=90)
+            drawn = False
+            if getattr(self.config, 'artist_cover_name_overlay', True):
+                try:
+                    render_artist_cover(image, artist_name, target)
+                    drawn = True
+                except Exception as overlay_err:
+                    self.logger.warning(f"Could not draw the name on {artist_name!r}'s picture, "
+                                        f"using the plain photo: {overlay_err}")
+            if not drawn:
+                image.save(target, 'JPEG', quality=90)
             try:
                 os.chmod(target, 0o664)
             except Exception as chmod_err:
@@ -1638,14 +1651,27 @@ class PlaylistGenerator:
         return self._audio_items_cache
 
     def _playlist_track_ids(self, playlist_id: str, user_id: str) -> List[str]:
-        """Track ids currently in a playlist, used to restore it if a replace fails."""
+        """Track ids currently in a playlist, used to restore it if a replace fails.
+
+        Shared playlists are made without a user id, and Jellyfin refuses to list a
+        playlist without one ("Guid can't be empty"), which silently disabled the
+        restore. Any user can read a shared playlist, so the first user stands in.
+        """
         try:
+            if not user_id:
+                if getattr(self, '_reader_user_id', None) is None:
+                    users = self.jellyfin.get_users()
+                    self._reader_user_id = users[0]['Id'] if users else ''
+                user_id = self._reader_user_id
+            if not user_id:
+                self.logger.warning(f"Cannot read playlist {playlist_id} before replacing it: no Jellyfin user found")
+                return []
             url = f"{self.jellyfin.config.jellyfin_url}/Playlists/{playlist_id}/Items"
             response = self.jellyfin.session.get(url, params={'UserId': user_id})
             response.raise_for_status()
             return [item['Id'] for item in response.json().get('Items', []) if item.get('Id')]
         except Exception as e:
-            self.logger.debug(f"Could not read tracks of playlist {playlist_id}: {e}")
+            self.logger.warning(f"Could not read tracks of playlist {playlist_id} before replacing it: {e}")
             return []
 
     def _remove_playlist_folder(self, jellyfin_path: str):
@@ -2309,7 +2335,7 @@ class PlaylistGenerator:
         try:
             with Image.open(BytesIO(source_image)) as source:
                 source.convert('RGB').save(tmp_bg, 'JPEG', quality=90)
-            render_genre_cover(tmp_bg, artist_name, tmp_out)
+            render_artist_cover(tmp_bg, artist_name, tmp_out)
             os.replace(tmp_out, destination)
             self.logger.info(f"✅ Generated artist cover art: {destination}")
             return True
@@ -3167,16 +3193,32 @@ class PlaylistGenerator:
         self.logger.info("JellyJams playlist generation completed successfully!")
         return {'playlists_created': self.created_playlists, 'playlists_retired': retired}
 
+def parse_args(argv):
+    """Command line of vibecodeplugin.py. An unknown flag is an error, not a silent start:
+    the plain command starts the scheduler and never returns, which is not what a
+    mistyped --dry-run should do."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='vibecodeplugin.py',
+        description='JellyJams playlist generator. With no flags it runs the scheduler.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='read everything, write nothing, and print what a run would do')
+    parser.add_argument('--retire-stale', action='store_true',
+                        help='run once and remove generated playlists that are no longer generated')
+    return parser.parse_args(argv)
+
+
 def main():
     """Main application entry point"""
+    args = parse_args(sys.argv[1:])
     config = Config()
-    dry_run = '--dry-run' in sys.argv[1:]
+    dry_run = args.dry_run
     config.dry_run = dry_run
-    if '--retire-stale' in sys.argv[1:]:
+    if args.retire_stale:
         config.retire_stale_playlists = True
     logger = setup_logging(config)
     
-    if dry_run or '--retire-stale' in sys.argv[1:]:
+    if dry_run or args.retire_stale:
         # One pass, no scheduling. With --dry-run nothing is written. Run it inside the
         # container:
         #   docker exec <container> python /app/vibecodeplugin.py --dry-run

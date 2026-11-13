@@ -50,10 +50,22 @@ def find_cover(cover_dir: Path, bases: Iterable[str]) -> Optional[Path]:
     return None
 
 
-def _background(path: Path, name: str, size: int) -> Image.Image:
-    """The photo, cropped to a square at a zoom and offset taken from the genre name."""
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source).convert('RGB')
+def _background(source_image, name: str, size: int, vary: bool = True) -> Image.Image:
+    """The photo (a path or a PIL image), cropped to a square.
+
+    With vary on, zoom and offset come from the name, so genres sharing one photo still
+    look different. With it off the photo is only centre-cropped, which is right for a
+    picture of a person.
+    """
+    if isinstance(source_image, Image.Image):
+        image = ImageOps.exif_transpose(source_image).convert('RGB')
+    else:
+        with Image.open(source_image) as source:
+            image = ImageOps.exif_transpose(source).convert('RGB')
+    if not vary:
+        side = min(image.size)
+        left, top = (image.width - side) // 2, (image.height - side) // 2
+        return image.crop((left, top, left + side, top + side)).resize((size, size), Image.Resampling.LANCZOS)
     digest = _digest(name)
     side = min(image.size)
     zoom = 1.0 + ((digest >> 8) % 36) / 100.0              # 1.00 .. 1.35
@@ -71,14 +83,17 @@ def _tint(image: Image.Image, hue: float) -> Image.Image:
                              white=_hsv(hue, 0.25, 1.00), midpoint=118).convert('RGB')
 
 
-def _layouts(genre: str) -> List[List[str]]:
-    """Ways to set 'GENRE / RADIO' on lines: one line for the genre, or two when it has words."""
-    words = genre.upper().split()
-    layouts = [[' '.join(words), 'RADIO']]
-    if len(words) > 1:
-        for cut in range(1, len(words)):
-            layouts.append([' '.join(words[:cut]), ' '.join(words[cut:]), 'RADIO'])
-    return layouts
+def _layouts(title: str, tag: str = 'RADIO', tag_first: bool = False) -> List[List[str]]:
+    """Ways to set the title and its tag on lines: 'HOUSE / RADIO', or 'THIS IS / USHER'.
+
+    The title goes on one line, or is split between words when it has several, whichever
+    lets the type come out largest.
+    """
+    words = title.upper().split()
+    splits = [[' '.join(words)]]
+    for cut in range(1, len(words)):
+        splits.append([' '.join(words[:cut]), ' '.join(words[cut:])])
+    return [([tag] + lines) if tag_first else (lines + [tag]) for lines in splits]
 
 
 def _fit(draw: ImageDraw.ImageDraw, lines: List[str], width: int, ceiling: int = 150):
@@ -92,17 +107,37 @@ def _fit(draw: ImageDraw.ImageDraw, lines: List[str], width: int, ceiling: int =
 
 def render_genre_cover(background_path, genre_name: str, destination, size: int = COVER_SIZE) -> Path:
     """Draw the cover for one genre and save it at `destination` (format from the extension)."""
-    genre_name = genre_name.strip()
-    image = _tint(_background(Path(background_path), genre_name, size), genre_hue(genre_name))
+    return render_cover(background_path, genre_name, destination, size=size)
+
+
+def render_artist_cover(photo, artist_name: str, destination, size: int = COVER_SIZE) -> Path:
+    """Draw 'THIS IS / ARTIST' over the artist's own photo, which keeps its natural colours."""
+    return render_cover(photo, artist_name, destination, size=size, tag='THIS IS', tag_first=True, tint=False)
+
+
+def render_cover(background, title: str, destination, size: int = COVER_SIZE, tag: str = 'RADIO',
+                 tag_first: bool = False, tint: bool = True) -> Path:
+    """Draw a cover and save it at `destination` (format from the extension).
+
+    `background` is a path or a PIL image. tint=True turns it into a duotone in the title's
+    own colour (genres); tint=False keeps the photo and only darkens a band behind the
+    text (artists). Same input, same output, on every machine.
+    """
+    title = title.strip()
+    image = _background(background if isinstance(background, Image.Image) else Path(background),
+                        title, size, vary=tint)
+    if tint:
+        image = _tint(image, genre_hue(title))
 
     # A soft dark band behind the text keeps it readable on any photo.
     shade = Image.new('RGBA', image.size, (0, 0, 0, 0))
-    ImageDraw.Draw(shade).rectangle((0, int(size * 0.22), size, int(size * 0.78)), fill=(0, 0, 0, 90))
+    ImageDraw.Draw(shade).rectangle((0, int(size * 0.22), size, int(size * 0.78)),
+                                    fill=(0, 0, 0, 90 if tint else 150))
     image = Image.alpha_composite(image.convert('RGBA'), shade.filter(ImageFilter.GaussianBlur(size * 0.06)))
 
     probe = ImageDraw.Draw(image)
     width = int(size * 0.84)
-    best = max(((_fit(probe, lines, width), lines) for lines in _layouts(genre_name)),
+    best = max(((_fit(probe, lines, width), lines) for lines in _layouts(title, tag, tag_first)),
                key=lambda candidate: candidate[0][1])
     (font, font_size), lines = best
 

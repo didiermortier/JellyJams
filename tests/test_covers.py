@@ -208,3 +208,125 @@ def test_artist_cover_fails_cleanly_on_a_broken_photo(plugin, tmp_path, monkeypa
 
     assert gen._generate_custom_cover_art(b"not an image", "Nobody", folder / "cover.webp") is False
     assert not (folder / "cover.webp").exists()
+
+
+# ---- artist covers say "THIS IS / <artist>" and keep the photo's colours --------------
+
+def test_artist_layout_puts_the_tag_first(cover):
+    assert cover._layouts("Usher", "THIS IS", True)[0] == ["THIS IS", "USHER"]
+    assert cover._layouts("Purple Disco Machine", "THIS IS", True)[1] == ["THIS IS", "PURPLE", "DISCO MACHINE"]
+    assert cover._layouts("Techno")[0] == ["TECHNO", "RADIO"]          # genres are unchanged
+
+
+def photo(color, size=(500, 500)):
+    from io import BytesIO
+    buf = BytesIO()
+    Image.new("RGB", size, color).save(buf, "JPEG")
+    return Image.open(BytesIO(buf.getvalue()))
+
+
+def test_artist_cover_keeps_the_photo_colours(cover, tmp_path):
+    out = cover.render_artist_cover(photo((200, 30, 30)), "Usher", tmp_path / "a.jpg")
+    corner = Image.open(out).convert("RGB").getpixel((10, 10))
+
+    assert corner[0] > 150 and corner[1] < 90 and corner[2] < 90        # still red, not duotone
+
+
+def test_genre_cover_is_tinted_in_the_genres_colour(cover, tmp_path):
+    out = cover.render_genre_cover(BACKGROUND, "Trance", tmp_path / "g.jpg")
+    r, g, b = Image.open(out).convert("RGB").resize((1, 1)).getpixel((0, 0))
+
+    assert max(r, g, b) - min(r, g, b) > 20                             # a colour, not grey
+
+
+def test_artist_cover_is_not_a_radio_cover(cover, tmp_path):
+    artist = cover.render_artist_cover(photo((90, 90, 90)), "Usher", tmp_path / "a.jpg")
+    radio = cover.render_genre_cover(photo((90, 90, 90)), "Usher", tmp_path / "r.jpg")
+
+    assert digest(artist) != digest(radio)
+
+
+def test_artist_cover_accepts_a_wide_photo(cover, tmp_path):
+    out = cover.render_artist_cover(photo((10, 120, 200), (900, 300)), "Nora en Pure", tmp_path / "w.jpg")
+
+    with Image.open(out) as image:
+        assert image.size == (600, 600)
+
+
+def test_the_artist_fallback_writes_this_is(plugin, tmp_path, monkeypatch):
+    """_generate_custom_cover_art draws the artist renderer, not the genre one."""
+    calls = []
+    monkeypatch.setattr(plugin, "render_artist_cover", lambda src, name, dest, **kw: calls.append(name) or Path(dest).write_bytes(b"x"))
+    from io import BytesIO
+    buf = BytesIO()
+    Image.new("RGB", (400, 400), (1, 2, 3)).save(buf, "JPEG")
+    gen, _, folder = make_generator(plugin, tmp_path, monkeypatch)
+
+    assert gen._generate_custom_cover_art(buf.getvalue(), "Usher", folder / "cover.webp")
+    assert calls == ["Usher"]
+
+
+class FakeDeezerResponse:
+    def __init__(self, content=b"", payload=None):
+        self.content, self._payload = content, payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def deezer_with(plugin, tmp_path, picture_bytes, overlay):
+    config = plugin.Config()
+    config.deezer_cover_art_enabled = True
+    config.artist_cover_name_overlay = overlay
+    client = plugin.DeezerClient(config, logging.getLogger("test"))
+
+    def get(url, **kw):
+        if "search/artist" in url:
+            return FakeDeezerResponse(payload={"data": [{"name": "Usher", "picture_xl": "http://x/p.jpg"}]})
+        return FakeDeezerResponse(content=picture_bytes)
+    client.session.get = get
+    folder = tmp_path / "pl"
+    folder.mkdir()
+    return client, folder
+
+
+def jpeg_bytes(color=(180, 40, 40), size=(1000, 1000)):
+    from io import BytesIO
+    buf = BytesIO()
+    Image.new("RGB", size, color).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def test_deezer_cover_gets_the_name_drawn_on_it(plugin, tmp_path):
+    client, folder = deezer_with(plugin, tmp_path, jpeg_bytes(), overlay=True)
+    (tmp_path / "plain").mkdir()
+    plain, plain_folder = deezer_with(plugin, tmp_path / "plain", jpeg_bytes(), overlay=False)
+
+    assert client.get_artist_cover_art("Usher", folder) is True
+    assert plain.get_artist_cover_art("Usher", plain_folder) is True
+
+    with Image.open(folder / "cover.jpg") as drawn, Image.open(plain_folder / "cover.jpg") as bare:
+        assert drawn.size == (600, 600) and bare.size == (1000, 1000)
+    assert digest(folder / "cover.jpg") != digest(plain_folder / "cover.jpg")
+
+
+def test_a_failed_overlay_falls_back_to_the_plain_photo(plugin, tmp_path, monkeypatch):
+    client, folder = deezer_with(plugin, tmp_path, jpeg_bytes(), overlay=True)
+    monkeypatch.setattr(plugin, "render_artist_cover", lambda *a, **k: (_ for _ in ()).throw(OSError("no font")))
+
+    assert client.get_artist_cover_art("Usher", folder) is True
+    with Image.open(folder / "cover.jpg") as image:
+        assert image.size == (1000, 1000)
+
+
+def test_the_overlay_setting_defaults_on_and_is_read_from_settings(plugin, tmp_path, monkeypatch):
+    import json
+    assert plugin.Config().artist_cover_name_overlay is True
+    settings = tmp_path / "s.json"
+    settings.write_text(json.dumps({"artist_cover_name_overlay": False}))
+    monkeypatch.setattr(plugin, "SETTINGS_FILE", str(settings))
+
+    assert plugin.Config().artist_cover_name_overlay is False

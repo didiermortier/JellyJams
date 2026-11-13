@@ -87,6 +87,7 @@ class ConfigManager:
             'spotify_client_secret': getattr(config, 'spotify_client_secret', ''),
             'spotify_cover_art_enabled': getattr(config, 'spotify_cover_art_enabled', False),
             'deezer_cover_art_enabled': getattr(config, 'deezer_cover_art_enabled', False),
+            'artist_cover_name_overlay': getattr(config, 'artist_cover_name_overlay', True),
             'enabled_genres': [],
             'enabled_years': [],
             'enabled_artists': [],
@@ -187,6 +188,7 @@ class ConfigManager:
         config.spotify_client_secret = settings.get('spotify_client_secret', getattr(config, 'spotify_client_secret', ''))
         config.spotify_cover_art_enabled = settings.get('spotify_cover_art_enabled', getattr(config, 'spotify_cover_art_enabled', False))
         config.deezer_cover_art_enabled = settings.get('deezer_cover_art_enabled', getattr(config, 'deezer_cover_art_enabled', False))
+        config.artist_cover_name_overlay = settings.get('artist_cover_name_overlay', getattr(config, 'artist_cover_name_overlay', True))
         
         # Apply playlist generation settings
         

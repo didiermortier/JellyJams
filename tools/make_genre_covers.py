@@ -39,6 +39,10 @@ GENRES = [
     # everything else people tag
     'Latin', 'Indie', 'Indie Pop', 'Indie Rock', 'Soundtrack', 'Ballad', 'Schlager', 'K-Pop',
     'Afrobeat', 'Celtic', 'Comedy', 'Easy Listening', 'Grunge', 'Britpop',
+    # tags a real library showed (the live server made a runtime cover for Pop Rap)
+    'Pop Rap', 'Liquid Funk', 'Tech Trance', 'Conscious Hip Hop', 'Gangsta Rap',
+    'East Coast Hip Hop', 'West Coast Hip Hop', 'Contemporary R&B', 'Dance-Pop', 'Europop',
+    'G-Funk', 'Art Pop', 'Samba', 'Tropical House', 'Alternative Hip Hop',
 ]
 
 
