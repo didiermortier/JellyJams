@@ -236,3 +236,9 @@ a.tile:hover { border-color: rgba(139, 92, 246, .5); background: var(--jj-surfac
   padding: 12px 0; margin-top: 8px;
   background: linear-gradient(180deg, transparent, var(--jj-bg) 40%);
 }
+
+/* Playlists grouped by kind */
+.pl-group { margin-bottom: 28px; }
+.pl-group-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.pl-group-head h2 { font-size: 1.05rem; font-weight: 600; margin: 0; }
+.pl-group-count { color: var(--jj-muted); font-size: .85rem; font-variant-numeric: tabular-nums; }

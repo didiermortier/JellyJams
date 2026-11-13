@@ -73,6 +73,10 @@
                             <span class="badge text-bg-secondary ms-1">Off</span>
                         {% endif %}
                     </dd>
+                    {% if next_run %}
+                    <dt>Next run</dt>
+                    <dd id="nextRun">{{ next_run }}</dd>
+                    {% endif %}
                     <dt>Last run</dt>
                     <dd id="lastRun" class="text-muted">Checking...</dd>
                 </dl>

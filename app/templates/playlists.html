@@ -6,7 +6,7 @@
 <div class="page-head">
     <div>
         <h1>Playlists</h1>
-        <p class="page-sub">{{ stats.total - stats.manual }} made by JellyJams, {{ stats.manual }} made by hand. Hand-made playlists are never changed.</p>
+        <p class="page-sub">{{ stats.total - stats.manual }} made by JellyJams, {{ stats.manual }} made by hand. Hand-made playlists are never changed or deleted.</p>
     </div>
     <div class="page-actions">
         <button type="button" class="btn btn-outline-primary" onclick="updateCovers()" id="updateCoversBtn">
@@ -24,6 +24,7 @@
         <input type="search" class="form-control" id="searchInput" placeholder="Search playlists" aria-label="Search playlists">
     </div>
     <div class="seg" id="filters" role="group" aria-label="Filter playlists">
+        <button type="button" data-filter="generated" onclick="filterPlaylists('generated')">Made by JellyJams<span class="count">({{ stats.total - stats.manual }})</span></button>
         <button type="button" data-filter="all" onclick="filterPlaylists('all')">All<span class="count">({{ stats.total }})</span></button>
         <button type="button" data-filter="genre" onclick="filterPlaylists('genre')">Genres<span class="count">({{ stats.genre }})</span></button>
         <button type="button" data-filter="year" onclick="filterPlaylists('year')">Years<span class="count">({{ stats.year }})</span></button>
@@ -33,8 +34,15 @@
     </div>
 </div>
 
-<div class="playlists-grid" id="playlistsContainer">
-    {% for playlist in playlists %}
+<div id="playlistsContainer">
+    {% for category, label, members in groups %}
+    <section class="pl-group" data-group="{{ category }}" aria-labelledby="group-{{ category }}">
+        <div class="pl-group-head">
+            <h2 id="group-{{ category }}">{{ label }}</h2>
+            <span class="pl-group-count">{{ members|length }}</span>
+        </div>
+        <div class="playlists-grid">
+        {% for playlist in members %}
         <div class="pl-item playlist-item"
              data-name="{{ playlist.name.lower() }}"
              data-type="{{ playlist.category }}">
@@ -77,8 +85,10 @@
                 </div>
             </div>
         </div>
+        {% endfor %}
+        </div>
+    </section>
     {% endfor %}
-
     <div class="empty-state" id="emptyState" {% if playlists %}hidden{% endif %}>
         <i class="fa-solid fa-music"></i>
         <h2 class="h5" id="emptyTitle">{{ 'No playlists found' if not playlists else 'Nothing matches' }}</h2>
@@ -164,15 +174,15 @@
 
 {% block scripts %}
 <script>
-let currentFilter = 'all';
-const FILTERS = ['all', 'genre', 'year', 'artist', 'personal', 'manual'];
+let currentFilter = 'generated';
+const FILTERS = ['generated', 'all', 'genre', 'year', 'artist', 'personal', 'manual'];
 
 $(document).ready(function() {
     $('#searchInput').on('input', function() { filterPlaylists(currentFilter); });
 
     // The dashboard tiles link here with #genre, #manual and so on.
     const fromHash = (location.hash || '').replace('#', '');
-    filterPlaylists(FILTERS.includes(fromHash) ? fromHash : 'all');
+    filterPlaylists(FILTERS.includes(fromHash) ? fromHash : 'generated');
 
     $(document).on('click', '.view-playlist-btn', function(e) {
         e.preventDefault();
@@ -194,9 +204,18 @@ function filterPlaylists(type) {
     let shown = 0;
     $('.playlist-item').each(function() {
         const $item = $(this);
-        const matches = String($item.data('name')).includes(searchTerm) && (type === 'all' || $item.data('type') === type);
+        const itemType = $item.data('type');
+        const inFilter = type === 'all' || (type === 'generated' ? itemType !== 'manual' : itemType === type);
+        const matches = String($item.data('name')).includes(searchTerm) && inFilter;
         $item.toggle(matches);
+        $item.attr('data-match', matches ? '1' : '0');
         if (matches) shown++;
+    });
+
+    // A heading with nothing under it is hidden.
+    $('.pl-group').each(function() {
+        // Count matches, not :visible, because a hidden group hides its own items.
+        $(this).toggle($(this).find('.playlist-item[data-match="1"]').length > 0);
     });
 
     const hasAny = $('.playlist-item').length > 0;

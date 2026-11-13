@@ -78,3 +78,48 @@ def test_no_page_uses_an_icon_the_bundled_font_lacks(webapp_module):
     for template in (root / "templates").glob("*.html"):
         used = set(re.findall(r"\b(fa-[a-z0-9-]+)", template.read_text())) - skip
         assert not (used - have), f"{template.name} uses missing icons {used - have}"
+
+
+from datetime import datetime  # noqa: E402
+
+
+def test_next_run_weekly_counts_to_the_right_weekday(webapp_module):
+    friday_noon = datetime(2026, 11, 13, 12, 0)   # a Friday
+    settings = {"schedule_mode": "weekly", "schedule_weekday": "sunday", "schedule_time": "04:30"}
+
+    assert webapp_module.next_run_time(settings, friday_noon) == datetime(2026, 11, 15, 4, 30)
+    assert webapp_module.describe_next_run(settings, friday_noon) == "Sunday 15 Nov at 04:30, in 1 day"
+
+
+def test_next_run_weekly_on_the_day_but_already_past_waits_a_week(webapp_module):
+    sunday_noon = datetime(2026, 11, 15, 12, 0)
+    settings = {"schedule_mode": "weekly", "schedule_weekday": "sunday", "schedule_time": "04:30"}
+
+    assert webapp_module.next_run_time(settings, sunday_noon) == datetime(2026, 11, 22, 4, 30)
+
+
+def test_next_run_daily_rolls_to_tomorrow_when_the_time_has_passed(webapp_module):
+    settings = {"schedule_mode": "daily", "schedule_time": "04:30"}
+
+    assert webapp_module.next_run_time(settings, datetime(2026, 11, 13, 3, 0)) == datetime(2026, 11, 13, 4, 30)
+    assert webapp_module.next_run_time(settings, datetime(2026, 11, 13, 5, 0)) == datetime(2026, 11, 14, 4, 30)
+
+
+def test_next_run_is_empty_for_manual_interval_and_bad_input(webapp_module):
+    for settings in ({"schedule_mode": "manual"}, {"schedule_mode": "interval"},
+                     {"schedule_mode": "daily", "schedule_time": "soon"}):
+        assert webapp_module.next_run_time(settings, datetime(2026, 11, 13, 12, 0)) is None
+        assert webapp_module.describe_next_run(settings, datetime(2026, 11, 13, 12, 0)) == ""
+
+
+def test_playlists_page_groups_by_kind_with_hand_made_last(webapp_module, tmp_path, monkeypatch):
+    for name in ("HOUSEMAFIA", "Zouk Radio", "This is Usher!"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "playlist.xml").write_text("<Item></Item>")
+    monkeypatch.setattr(webapp_module.config, "playlist_folder", str(tmp_path))
+
+    html = webapp_module.app.test_client().get("/playlists").get_data(as_text=True)
+
+    assert html.index('data-group="genre"') < html.index('data-group="artist"') < html.index('data-group="manual"')
+    assert 'data-group="year"' not in html          # empty groups are left out
+    assert 'data-filter="generated"' in html
