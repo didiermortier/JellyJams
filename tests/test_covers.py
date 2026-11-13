@@ -67,9 +67,11 @@ def test_text_fits_the_width_for_long_names(cover, tmp_path):
     from PIL import ImageDraw
     probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
     for genre in ("Progressive House", "Singer-Songwriter", "Experimental Industrial Noise Ambient Drone"):
-        best = max((cover._fit(probe, lines, 504)[1], lines) for lines in cover._layouts(genre))
-        font, size = cover._fit(probe, best[1], 504)
-        assert max(probe.textlength(line, font=font) for line in best[1]) <= 504 or size == 24
+        font, size = max((cover._fit(probe, lines, 504, 120, cover.GENRE_FONT) for lines in cover._title_lines(genre)),
+                         key=lambda fitted: fitted[1])
+        best = [lines for lines in cover._title_lines(genre)
+                if cover._fit(probe, lines, 504, 120, cover.GENRE_FONT)[1] == size][0]
+        assert max(probe.textlength(line, font=font) for line in best) <= 504 or size == 18
 
 
 # ---- finding shipped covers -----------------------------------------------------
@@ -154,8 +156,11 @@ def test_shipped_covers_are_the_expected_size(cover):
             assert image.size == (600, 600), path.name
 
 
-def test_the_font_ships_with_the_app(cover):
-    assert cover.FONT_PATH.is_file()
+def test_the_fonts_ship_with_the_app(cover):
+    for font in (cover.GENRE_FONT, cover.ARTIST_FONT, cover.FONT_PATH):
+        assert font.is_file(), font
+    for licence in ("Montserrat-OFL.txt", "Oswald-OFL.txt", "DejaVu-LICENSE.txt"):
+        assert (cover.FONT_DIR / licence).is_file(), licence
 
 
 # ---- syncing covers into the data folder -----------------------------------------
@@ -212,10 +217,10 @@ def test_artist_cover_fails_cleanly_on_a_broken_photo(plugin, tmp_path, monkeypa
 
 # ---- artist covers say "THIS IS / <artist>" and keep the photo's colours --------------
 
-def test_artist_layout_puts_the_tag_first(cover):
-    assert cover._layouts("Usher", "THIS IS", True)[0] == ["THIS IS", "USHER"]
-    assert cover._layouts("Purple Disco Machine", "THIS IS", True)[1] == ["THIS IS", "PURPLE", "DISCO MACHINE"]
-    assert cover._layouts("Techno")[0] == ["TECHNO", "RADIO"]          # genres are unchanged
+def test_titles_are_split_between_words(cover):
+    assert cover._title_lines("Usher") == [["USHER"]]
+    assert cover._title_lines("Purple Disco Machine") == [
+        ["PURPLE DISCO MACHINE"], ["PURPLE", "DISCO MACHINE"], ["PURPLE DISCO", "MACHINE"]]
 
 
 def photo(color, size=(500, 500)):
@@ -330,3 +335,121 @@ def test_the_overlay_setting_defaults_on_and_is_read_from_settings(plugin, tmp_p
     monkeypatch.setattr(plugin, "SETTINGS_FILE", str(settings))
 
     assert plugin.Config().artist_cover_name_overlay is False
+
+
+# ---- where the text sits ---------------------------------------------------------------
+
+def white_share(image, box):
+    region = image.convert("L").crop(box)
+    return sum(1 for p in region.getdata() if p > 235) / (region.width * region.height)
+
+
+def test_artist_text_is_at_the_bottom_left(cover, tmp_path):
+    out = cover.render_artist_cover(photo((90, 90, 90)), "Usher", tmp_path / "a.jpg")
+    image = Image.open(out)
+
+    bottom_left = white_share(image, (0, 360, 300, 600))
+    assert bottom_left > 0.05
+    assert bottom_left > 5 * white_share(image, (300, 360, 600, 600))     # not centred, not right
+    assert white_share(image, (0, 0, 600, 300)) < 0.001                   # the top half stays clear
+
+
+def test_artist_text_is_much_smaller_than_it_was(cover, tmp_path):
+    """The old cover filled the middle with a name up to 150 px high; this one stays near 60."""
+    out = cover.render_artist_cover(photo((90, 90, 90)), "Usher", tmp_path / "a.jpg")
+    image = Image.open(out).convert("L")
+    rows = [y for y in range(600) if any(image.getpixel((x, y)) > 235 for x in range(0, 600, 3))]
+
+    assert rows and max(rows) - min(rows) < 170                           # tag, bar and name together
+    assert min(rows) > 380
+
+
+def test_a_long_artist_name_stays_on_the_cover(cover, tmp_path):
+    out = cover.render_artist_cover(photo((90, 90, 90)), "Red Hot Chili Peppers", tmp_path / "a.jpg")
+    image = Image.open(out)
+
+    assert white_share(image, (0, 0, 600, 360)) < 0.001
+    assert white_share(image, (590, 360, 600, 600)) == 0                  # nothing runs off the right edge
+
+
+def test_a_very_long_artist_name_is_split_not_shrunk_to_nothing(cover, tmp_path):
+    from PIL import ImageDraw
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    name = "The Extraordinarily Long Named Orchestra Of Somewhere"
+    single, *splits = cover._title_lines(name)
+    _, one_line = cover._fit(probe, single, 516, 84, cover.ARTIST_FONT)
+
+    assert one_line < 44
+    out = cover.render_artist_cover(photo((90, 90, 90)), name, tmp_path / "a.jpg")
+    assert Image.open(out).size == (600, 600)
+
+
+def test_genre_text_is_centred(cover, tmp_path):
+    image = Image.open(cover.render_genre_cover(BACKGROUND, "Techno", tmp_path / "g.jpg"))
+
+    left, right = white_share(image, (0, 200, 300, 400)), white_share(image, (300, 200, 600, 400))
+    assert left > 0.02 and abs(left - right) < 0.35 * max(left, right)
+
+
+def test_radio_is_small_under_the_genre_name(cover, tmp_path):
+    """RADIO is a small tag now: the name takes much more ink than the tag below it."""
+    image = Image.open(cover.render_genre_cover(BACKGROUND, "Techno", tmp_path / "g.jpg")).convert("L")
+    rows = [sum(1 for x in range(600) if image.getpixel((x, y)) > 235) for y in range(600)]
+    inked = [y for y, n in enumerate(rows) if n > 0]
+    bands, start = [], inked[0]
+    for a, b in zip(inked, inked[1:] + [None]):
+        if b is None or b - a > 3:
+            bands.append((start, a))
+            start = b
+    name_band, tag_band = bands[0], bands[-1]
+
+    assert len(bands) == 2
+    assert (name_band[1] - name_band[0]) > 2.5 * (tag_band[1] - tag_band[0])
+
+
+def test_letters_the_font_lacks_fall_back_to_dejavu(cover):
+    assert cover._face(cover.ARTIST_FONT, "USHER") == cover.ARTIST_FONT
+    assert cover._face(cover.ARTIST_FONT, "МАРИЯ") == cover.ARTIST_FONT      # Cyrillic is in Oswald
+    assert cover._face(cover.ARTIST_FONT, "ΒΑΓΓΕΛΗΣ") == cover.FONT_PATH     # Greek is not
+    assert cover._face(cover.GENRE_FONT, "TECHNO") == cover.GENRE_FONT
+
+
+def test_a_greek_name_still_gets_a_cover(cover, tmp_path):
+    out = cover.render_artist_cover(photo((90, 90, 90)), "Βαγγέλης", tmp_path / "a.jpg")
+
+    assert white_share(Image.open(out), (0, 360, 300, 600)) > 0.03
+
+
+# ---- new drawings reach an existing install ------------------------------------------------
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_sync_replaces_a_cover_an_earlier_version_shipped(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir(), dst.mkdir()
+    (src / "Jazz Radio.jpg").write_bytes(b"new jazz")
+    (src / "Trance Radio.jpg").write_bytes(b"new trance")
+    (dst / "Jazz Radio.jpg").write_bytes(b"old jazz")                  # as an earlier version shipped it
+    (dst / "Trance Radio.jpg").write_bytes(b"my own trance cover")      # changed by hand
+    superseded = tmp_path / "superseded.sha256"
+    superseded.write_text(sha(b"old jazz") + "\n" + sha(b"old trance") + "\n")
+
+    result = subprocess.run([str(ROOT / "app" / "sync_covers.sh"), str(src), str(dst), str(superseded)],
+                            capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert (dst / "Jazz Radio.jpg").read_bytes() == b"new jazz"
+    assert (dst / "Trance Radio.jpg").read_bytes() == b"my own trance cover"
+    assert "1 updated" in result.stdout
+
+
+def test_every_cover_the_new_drawings_replace_is_in_the_superseded_list():
+    """The list holds the hash of each cover the previous release shipped, so an install that
+    never touched them gets the new look. None of today's files may be on it."""
+    listed = set((ROOT / "app" / "cover-superseded.sha256").read_text().split())
+    shipped = {sha(p.read_bytes()) for p in COVER_DIR.glob("*.jpg")}
+
+    assert len(listed) == 87
+    assert not listed & shipped

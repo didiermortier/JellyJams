@@ -79,8 +79,8 @@ Genre tags are compared without regard to case, so `Hip Hop` and `hip hop` count
 
 ## Covers
 
-- **Genre and decade:** drawn once and shipped in `app/cover`. On start, new ones are copied into `/data/cover` without overwriting anything. To use your own image, put a file with the playlist's name in `/data/cover`, for example `Jazz Radio.jpg`.
-- **Artist:** the photo comes from Deezer's public API (no account or key). The artist's name is drawn on it with a bundled font. Switch the name off on the Settings page to keep the plain photo. If Deezer has nothing, the artist's own `folder.jpg` from your music folder is used.
+- **Genre and decade:** drawn once and shipped in `app/cover`: the genre name in large type with a small "RADIO" under it. On start, new ones are copied into `/data/cover`, and a cover that an earlier version shipped and you never touched is replaced by the new drawing. To use your own image, put a file with the playlist's name in `/data/cover`, for example `Jazz Radio.jpg`. It is never overwritten.
+- **Artist:** the photo comes from Deezer's public API (no account or key). "THIS IS" and the artist's name are drawn at the bottom left with a bundled font. Switch the name off on the Settings page to keep the plain photo. If Deezer has nothing, the artist's own `folder.jpg` from your music folder is used.
 - **Spotify** is optional and tried after Deezer. Its artist search needs a developer app whose owner has a Premium subscription.
 
 Press **Update covers** on the Playlists page to refresh covers without regenerating.
@@ -122,6 +122,6 @@ tools/make_genre_covers.py   how the shipped covers were drawn
 
 ## License and credits
 
-GPL-3.0, see [LICENSE](LICENSE). Original project by [jonasmore](https://github.com/jonasmore/jellyjams). Built with [Jellyfin](https://jellyfin.org/), [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), [Inter](https://rsms.me/inter/) and [DejaVu Sans](https://dejavu-fonts.github.io/). Cover backgrounds are [Unsplash](https://unsplash.com/license) photos.
+GPL-3.0, see [LICENSE](LICENSE). Original project by [jonasmore](https://github.com/jonasmore/jellyjams). Built with [Jellyfin](https://jellyfin.org/), [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), [Inter](https://rsms.me/inter/) and [Montserrat](https://github.com/JulietaUla/Montserrat), [Oswald](https://github.com/googlefonts/OswaldFont) and [DejaVu Sans](https://dejavu-fonts.github.io/) (fonts, under their own licenses in `app/fonts`). Cover backgrounds are [Unsplash](https://unsplash.com/license) photos.
 
 Questions and bugs: [open an issue](https://github.com/didiermortier/JellyJams/issues).
