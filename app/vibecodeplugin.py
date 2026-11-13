@@ -76,6 +76,10 @@ class Config:
         self.adopt_existing_playlists = os.getenv('ADOPT_EXISTING_PLAYLISTS', 'false').lower() == 'true'
         # Set by `python vibecodeplugin.py --dry-run`: read everything, write nothing.
         self.dry_run = False
+        # Remove playlists JellyJams made earlier that this run no longer generates (for
+        # example the old per-genre playlists after the caps came in). Off by default;
+        # `python vibecodeplugin.py --retire-stale` turns it on for one pass.
+        self.retire_stale_playlists = os.getenv('RETIRE_STALE_PLAYLISTS', 'false').lower() == 'true'
         
         # Set default values for web UI configurable variables
         self.generation_interval = 24
@@ -1597,6 +1601,8 @@ class PlaylistGenerator:
         self.dry_run_plan: List[Dict] = []
         # Genre, decade and artist playlists chosen so far this run, for max_total_playlists
         self.shared_planned = 0
+        # Every playlist name this run set out to make, whether or not the create worked
+        self.planned_names = set()
         self.jellyfin = JellyfinAPI(config, logger)
         self.spotify = SpotifyClient(config, logger)
         self.deezer = DeezerClient(config, logger)
@@ -1688,13 +1694,27 @@ class PlaylistGenerator:
             self.logger.info(f"📋 Adopted {adopted} playlist(s). Turn ADOPT_EXISTING_PLAYLISTS off again.")
         return adopted
 
+    def _record(self) -> Dict[str, str]:
+        """The managed-playlist record as this run sees it.
+
+        In a dry run with ADOPT_EXISTING_PLAYLISTS on, the adoption that a real run would
+        do is shown as already done, so the preview matches what the real run does.
+        """
+        managed = load_managed_playlists()
+        if self.config.dry_run and self.config.adopt_existing_playlists:
+            for item in self.jellyfin.list_playlists():
+                name = item.get('Name')
+                if name and is_generated_playlist_name(name) and name not in managed:
+                    managed[name] = item.get('Id')
+        return managed
+
     def _classify_existing(self, name: str, user_id: str):
         """Split the playlists called `name` into (ours, foreign). Reads only.
 
         Ours means the playlist id is the one JellyJams recorded when it created it.
         Everything else with that name, including a hand-made playlist, is foreign.
         """
-        managed = load_managed_playlists()
+        managed = self._record()
         ours, foreign = [], []
         for item in self.jellyfin.find_playlists_by_name(name, user_id):
             (ours if managed.get(name) == item.get('Id') else foreign).append(item)
@@ -1702,12 +1722,63 @@ class PlaylistGenerator:
 
     def dry_run_report(self) -> Dict:
         """What a dry run would do, plus generated-looking playlists it will not touch."""
-        managed_ids = set(load_managed_playlists().values())
+        managed_ids = set(self._record().values())
         unrecorded = sorted(
             item.get('Name') for item in self.jellyfin.list_playlists()
             if is_generated_playlist_name(item.get('Name', '')) and item.get('Id') not in managed_ids
         )
-        return {'plan': list(self.dry_run_plan), 'unrecorded_generated': unrecorded}
+        return {'plan': list(self.dry_run_plan), 'unrecorded_generated': unrecorded,
+                'retire': self.plan_retirement()}
+
+    # The playlist kinds a run can retire, and the playlist type setting that makes them.
+    RETIRABLE_TYPES = {'genre': 'Genre', 'year': 'Year', 'artist': 'Artist'}
+
+    def plan_retirement(self) -> List[Dict]:
+        """Playlists JellyJams made earlier that this run no longer generates. Reads only.
+
+        A playlist is on the list only when all of these hold: its id is in the record,
+        its name is a generated one, it is a genre, decade or artist playlist whose type
+        is switched on for this run (a type you turned off is not touched), this run did
+        not plan to make it, and Jellyfin still shows that id under that very name (a
+        playlist you renamed since is yours now). Personal mixes are never retired.
+        """
+        enabled = set(self.config.playlist_types or [])
+        # A kind this run made nothing of (a library that lost its tags, a cap of zero) is
+        # never wiped: that looks like a broken run, not a wish to delete everything.
+        made = {categorize_playlist(n) for n in self.planned_names}
+        record = self._record()
+        by_id = {item.get('Id'): item for item in self.jellyfin.list_playlists()}
+        stale = []
+        for name, playlist_id in sorted(record.items()):
+            kind = categorize_playlist(name)
+            if (self.RETIRABLE_TYPES.get(kind) not in enabled or kind not in made
+                    or name in self.planned_names):
+                continue
+            item = by_id.get(playlist_id)
+            if not item or normalize_name(item.get('Name', '')) != normalize_name(name):
+                continue
+            stale.append({'name': name, 'id': playlist_id, 'kind': kind, 'path': item.get('Path')})
+        return stale
+
+    def retire_stale_playlists(self) -> int:
+        """Delete the playlists plan_retirement lists, and forget them in the record."""
+        if self.config.dry_run:
+            return 0
+        retired = 0
+        managed = load_managed_playlists()
+        for entry in self.plan_retirement():
+            if not is_generated_playlist_name(entry['name']):      # belt and braces
+                continue
+            if self.jellyfin.delete_playlist(entry['id']):
+                self._remove_playlist_folder(entry.get('path'))
+                managed.pop(entry['name'], None)
+                retired += 1
+                self.logger.info(f"🧹 Retired '{entry['name']}' (id {entry['id']}): no longer generated")
+            else:
+                self.logger.warning(f"⚠️ Could not retire '{entry['name']}' (id {entry['id']})")
+        if retired:
+            save_managed_playlists(managed)
+        return retired
 
     def _log_dry_run_report(self):
         report = self.dry_run_report()
@@ -1721,6 +1792,11 @@ class PlaylistGenerator:
             entries = by_action[action]
             lines.append(f"{label}: {len(entries)}")
             lines.extend(f"    {e['name']}  [{e['type']}, {e['tracks']} tracks]" for e in entries)
+        retire = report['retire']
+        lines.append(f"Would RETIRE (made by JellyJams, no longer generated): {len(retire)}")
+        lines.extend(f"    {e['name']}" for e in retire)
+        if retire:
+            lines.append("    (removed only by a real run with --retire-stale or RETIRE_STALE_PLAYLISTS=true)")
         unrecorded = report['unrecorded_generated']
         lines.append(f"Generated-looking playlists JellyJams has no record of, left alone: {len(unrecorded)}")
         lines.extend(f"    {name}" for name in unrecorded)
@@ -2590,6 +2666,8 @@ class PlaylistGenerator:
         self.logger.info(f"Playlist Type: {playlist_type}")
         self.logger.info(f"Original Playlist Name: {repr(name)}")
         
+        self.planned_names.add(normalize_name(name))
+        
         # Sanitize the playlist name to prevent filesystem errors
         sanitized_name = self._sanitize_playlist_name(name)
         playlist_subdir = self._jellyfin_playlist_dir(sanitized_name)
@@ -3284,6 +3362,7 @@ class PlaylistGenerator:
         self.created_playlists = 0
         self.dry_run_plan = []
         self.shared_planned = 0
+        self.planned_names = set()
         if self.config.dry_run:
             self.logger.info("🔎 DRY RUN: reading the library, writing nothing to Jellyfin or /data")
         self.adopt_existing_playlists()
@@ -3327,6 +3406,11 @@ class PlaylistGenerator:
         if self.config.dry_run:
             self._log_dry_run_report()
             return {'dry_run': True, 'planned': len(self.dry_run_plan)}
+        
+        retired = 0
+        if self.config.retire_stale_playlists:
+            retired = self.retire_stale_playlists()
+            self.logger.info(f"🧹 Retired {retired} playlist(s) that are no longer generated")
 
         if self.config.trigger_library_scan:
             self.logger.info("Triggering Jellyfin media library scan to refresh playlists...")
@@ -3336,18 +3420,22 @@ class PlaylistGenerator:
                 self.logger.warning("⚠️ Failed to trigger media library scan")
         
         self.logger.info("JellyJams playlist generation completed successfully!")
-        return {'playlists_created': self.created_playlists}
+        return {'playlists_created': self.created_playlists, 'playlists_retired': retired}
 
 def main():
     """Main application entry point"""
     config = Config()
     dry_run = '--dry-run' in sys.argv[1:]
     config.dry_run = dry_run
+    if '--retire-stale' in sys.argv[1:]:
+        config.retire_stale_playlists = True
     logger = setup_logging(config)
     
-    if dry_run:
-        # One pass, no scheduling, nothing written. Run it inside the container:
+    if dry_run or '--retire-stale' in sys.argv[1:]:
+        # One pass, no scheduling. With --dry-run nothing is written. Run it inside the
+        # container:
         #   docker exec <container> python /app/vibecodeplugin.py --dry-run
+        #   docker exec <container> python /app/vibecodeplugin.py --retire-stale
         if not config.api_key:
             logger.error("JELLYFIN_API_KEY environment variable is required!")
             sys.exit(1)

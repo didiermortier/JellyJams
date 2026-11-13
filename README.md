@@ -49,7 +49,23 @@
 >    pass and writes nothing to Jellyfin or `/data`: no playlists, no covers, no record, no library
 >    scan, no status file. It logs what it would create, replace and skip, and lists generated-looking
 >    playlists it has no record of.
-> 12. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
+> 12. **Fewer, better genre and artist playlists.** Genre tags are compared without regard to case
+>    and aliases are merged (`Hip Hop` and `hip hop` are one genre). The biggest 14 genres
+>    (`max_genre_playlists`) are always made, plus 2 spotlight genres (`genre_spotlight_slots`) that
+>    rotate every week through the smaller ones. A genre group that holds more than a quarter of the
+>    library is too broad to be one playlist, so its members stand alone: a house-heavy library gets
+>    House, Progressive House and Deep House instead of one huge Electronic. Artist playlists go to
+>    the 20 artists with the most tracks (`max_artist_playlists`), and genre, decade and artist
+>    playlists together never exceed `max_total_playlists` (45). All of these are on the settings
+>    page. Personal mixes are not counted.
+> 13. **Retiring old playlists.** Playlists JellyJams made earlier that a run no longer generates (the
+>    old per-genre playlists, for example) are listed by `--dry-run` under "Would RETIRE". They are
+>    only removed by `docker exec <container> python /app/vibecodeplugin.py --retire-stale`, or on
+>    every run with `RETIRE_STALE_PLAYLISTS=true`. Only playlists in the record, still under the same
+>    name, are retired; personal mixes, hand-made playlists and any kind of playlist the run made none
+>    of are never touched. To clean up an install that has no record yet, run with
+>    `ADOPT_EXISTING_PLAYLISTS=true`: the dry run then shows exactly what adopting and retiring would do.
+> 14. **Delete All in the web UI** used to remove every folder in the playlist directory, hand-made
 >    playlists included, and it removed only the folders: the Jellyfin items stayed and the scanner
 >    brought them back as empty playlists. That is one way playlists end up present but empty. It now
 >    deletes only generated names from the managed record, through the API, and reports what it left
